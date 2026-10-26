@@ -2,14 +2,69 @@ use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_tls_with_config;
+use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::config::StationConfig;
 use crate::connect::protocol::{IncomingMessage, OutgoingMessage, PlayerCommand, PlayerState};
+
+#[derive(Debug)]
+struct DangerNoVerify;
+
+impl ServerCertVerifier for DangerNoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn create_tls_connector() -> Connector {
+    let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(DangerNoVerify))
+        .with_no_client_auth();
+
+    Connector::Rustls(Arc::new(config))
+}
 
 pub struct ConnectClient {
     config: Arc<StationConfig>,
@@ -72,7 +127,12 @@ impl ConnectClient {
 
     async fn connect_and_process(&mut self) -> Result<()> {
         let ws_url = self.config.websocket_url()?;
-        let (ws_stream, response) = connect_async(&ws_url)
+        let connector = if ws_url.starts_with("wss://") {
+            Some(create_tls_connector())
+        } else {
+            None
+        };
+        let (ws_stream, response) = connect_async_tls_with_config(&ws_url, None, false, connector)
             .await
             .with_context(|| format!("Не удалось установить WebSocket соединение с {}", ws_url))?;
 
