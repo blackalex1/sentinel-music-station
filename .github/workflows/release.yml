@@ -27,19 +27,30 @@ jobs:
       matrix:
         include:
           - target: armv7-unknown-linux-gnueabihf
-            zig_target: armv7-unknown-linux-gnueabihf.2.17
             arch_name: armv7
             desc: "Яндекс.Станция (Мини 1/2, Лайт, Станция 2), Raspberry Pi 32-bit"
+            builder: zigbuild
+            zig_target: armv7-unknown-linux-gnueabihf.2.17
+            cross_pkg: ""
+            foreign_arch: ""
 
           - target: aarch64-unknown-linux-gnu
-            zig_target: aarch64-unknown-linux-gnu.2.17
             arch_name: aarch64
             desc: "64-битные ARM устройства (Raspberry Pi 4/5, Orange Pi, Linux SBC)"
+            builder: cargo
+            cross_pkg: gcc-aarch64-linux-gnu libc6-dev-arm64-cross libasound2-dev:arm64
+            foreign_arch: arm64
+            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
+            linker: aarch64-linux-gnu-gcc
 
           - target: x86_64-unknown-linux-gnu
-            zig_target: x86_64-unknown-linux-gnu.2.17
             arch_name: x86_64
             desc: "Linux x86_64 (ПК, сервер, ноутбук)"
+            builder: cargo
+            cross_pkg: libasound2-dev
+            foreign_arch: ""
+            pkg_config_path: /usr/lib/x86_64-linux-gnu/pkgconfig
+            linker: gcc
 
     steps:
       - name: Checkout repository
@@ -50,18 +61,28 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install System Dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          if [ -n "${{ matrix.foreign_arch }}" ]; then
+            sudo dpkg --add-architecture ${{ matrix.foreign_arch }}
+            sudo sed -i 's/^Types: deb/Types: deb\nArchitectures: amd64 i386/' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+            printf "Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble noble-updates noble-security\nComponents: main universe\nArchitectures: %s\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n" "${{ matrix.foreign_arch }}" | sudo tee /etc/apt/sources.list.d/ports.sources
+          fi
+          if [ -n "${{ matrix.cross_pkg }}" ]; then
+            sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${{ matrix.cross_pkg }} pkg-config
+          fi
+
       - name: Install Zig
+        if: matrix.builder == 'zigbuild'
         uses: mlugg/setup-zig@v1
         with:
           version: 0.13.0
 
       - name: Install cargo-zigbuild
+        if: matrix.builder == 'zigbuild'
         uses: taiki-e/install-action@cargo-zigbuild
-
-      - name: Install ALSA dev headers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev pkg-config
 
       - name: Cache Cargo Dependencies
         uses: swatinem/rust-cache@v2
@@ -70,10 +91,18 @@ jobs:
 
       - name: Build Binary (${{ matrix.target }})
         run: |
-          chmod +x scripts/fake-pkg-config.sh
-          export PKG_CONFIG="$(pwd)/scripts/fake-pkg-config.sh"
-          export PKG_CONFIG_ALLOW_CROSS=1
-          cargo zigbuild --target ${{ matrix.zig_target }} --release
+          if [ "${{ matrix.builder }}" = "zigbuild" ]; then
+            chmod +x scripts/fake-pkg-config.sh
+            export PKG_CONFIG="$(pwd)/scripts/fake-pkg-config.sh"
+            export PKG_CONFIG_ALLOW_CROSS=1
+            cargo zigbuild --target ${{ matrix.zig_target }} --release
+          else
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PKG_CONFIG_PATH="${{ matrix.pkg_config_path }}"
+            TARGET_ENV=$(echo "${{ matrix.target }}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+            export CARGO_TARGET_${TARGET_ENV}_LINKER="${{ matrix.linker }}"
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Package Release Archive (${{ matrix.target }})
         run: |
