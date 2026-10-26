@@ -153,12 +153,13 @@ impl ConnectClient {
                 info!("Добро пожаловать в Sentinel Connect! Зарегистрирован как ID: {}, активных устройств в сети: {}", device_id, devices.len());
                 if let Some(ref tx) = self.remote_state_tx {
                     for dev in &devices {
-                        if dev.get("device_id").and_then(|v| v.as_str()) != Some(&device_id) {
-                            if let Some(state_val) = dev.get("state") {
-                                if let Ok(st) = serde_json::from_value::<PlayerState>(state_val.clone()) {
-                                    let _ = tx.send(st);
-                                    break;
-                                }
+                        let dev_id = dev.get("id").or_else(|| dev.get("device_id")).and_then(|v| v.as_str());
+                        if dev_id != Some(&device_id) {
+                            let state_val = dev.get("state").unwrap_or(dev);
+                            if let Ok(st) = serde_json::from_value::<PlayerState>(state_val.clone()) {
+                                info!("TUI: синхронизировано состояние с '{}' (играет: {}, громкость: {}%)", dev_id.unwrap_or("?"), st.is_playing, (st.volume * 100.0) as u32);
+                                let _ = tx.send(st);
+                                break;
                             }
                         }
                     }
@@ -181,13 +182,29 @@ impl ConnectClient {
             }
             Ok(IncomingMessage::DevicesUpdate { devices }) => {
                 info!("Обновление списка устройств в доме: {} шт.", devices.len());
+                if let Some(ref tx) = self.remote_state_tx {
+                    for dev in &devices {
+                        let dev_id = dev.get("id").or_else(|| dev.get("device_id")).and_then(|v| v.as_str());
+                        if dev_id != Some(&self.config.device_id) {
+                            let state_val = dev.get("state").unwrap_or(dev);
+                            if let Ok(st) = serde_json::from_value::<PlayerState>(state_val.clone()) {
+                                let _ = tx.send(st);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             Ok(IncomingMessage::DeviceState { device_id, device }) => {
                 tracing::debug!("Устройство {} обновило состояние", device_id);
                 if let Some(ref tx) = self.remote_state_tx {
-                    if let Some(state_val) = device.get("state") {
-                        if let Ok(st) = serde_json::from_value::<PlayerState>(state_val.clone()) {
+                    let state_val = device.get("state").unwrap_or(&device);
+                    match serde_json::from_value::<PlayerState>(state_val.clone()) {
+                        Ok(st) => {
                             let _ = tx.send(st);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Не удалось распарсить PlayerState из device_state от {}: {}", device_id, e);
                         }
                     }
                 }

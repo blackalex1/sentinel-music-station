@@ -5,7 +5,7 @@ pub mod led_matrix;
 pub mod led_ring;
 pub mod spectrum;
 
-pub use ascii::render_ascii_bars;
+pub use ascii::{render_ascii_bars, render_spectrum_lines, render_standby_lines};
 pub use display::{DisplayCommand, DisplayManager};
 pub use led_clock::{DisplayFrame, LedHardwareDriver};
 pub use led_matrix::LedMatrixController;

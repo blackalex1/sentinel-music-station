@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::config::StationConfig;
 use crate::connect::protocol::{PlayerCommand, PlayerState};
-use crate::visualizer::{render_ascii_bars, SpectrumAnalyzer};
+use crate::visualizer::{render_spectrum_lines, render_standby_lines, SpectrumAnalyzer};
 
 pub struct TuiApp {
     config: Arc<StationConfig>,
@@ -23,6 +23,7 @@ pub struct TuiApp {
     is_connected_rx: watch::Receiver<bool>,
     sample_buffer: Arc<Mutex<Vec<f32>>>,
     spectrum_analyzer: SpectrumAnalyzer,
+    start_time: std::time::Instant,
 }
 
 impl TuiApp {
@@ -39,7 +40,8 @@ impl TuiApp {
             state_rx,
             is_connected_rx,
             sample_buffer,
-            spectrum_analyzer: SpectrumAnalyzer::new(1024, 16),
+            spectrum_analyzer: SpectrumAnalyzer::new(1024, 24),
+            start_time: std::time::Instant::now(),
         }
     }
 
@@ -55,15 +57,13 @@ impl TuiApp {
                 Vec::new()
             };
 
+            let state = self.state_rx.borrow().clone();
             let bands = if !samples.is_empty() {
                 self.spectrum_analyzer.compute(&samples)
+            } else if state.is_playing {
+                self.generate_live_bands(state.position_ms, 24)
             } else {
-                let state = self.state_rx.borrow();
-                if state.is_playing {
-                    Self::generate_live_bands(state.position_ms)
-                } else {
-                    vec![0.0; 16]
-                }
+                Vec::new()
             };
 
             terminal.draw(|f| {
@@ -121,7 +121,7 @@ impl TuiApp {
             .constraints([
                 Constraint::Length(3),  // Шапка (Статус, имя)
                 Constraint::Length(7),  // Текущий трек и прогресс
-                Constraint::Min(6),     // Анализатор спектра (FFT)
+                Constraint::Min(8),     // Анализатор спектра (FFT) / Standby экран
                 Constraint::Length(3),  // Панель подсказок / клавиш
             ])
             .split(f.area());
@@ -215,23 +215,32 @@ impl TuiApp {
     }
 
     fn draw_visualizer(&self, f: &mut Frame, area: Rect, bands: &[f32]) {
+        let is_playing = self.state_rx.borrow().is_playing;
+        let title = if is_playing {
+            " 📊 СПЕКТРОГРАММА В РЕАЛЬНОМ ВРЕМЕНИ (FFT) "
+        } else {
+            " ⏸ СТАТУС ПЛЕЕРА И ЭКВАЛАЙЗЕР "
+        };
+
         let block = Block::default()
-            .title(" 📊 СПЕКТРОГРАММА В РЕАЛЬНОМ ВРЕМЕНИ (FFT) ")
+            .title(title)
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded);
 
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        if inner.height < 2 {
+        if inner.height < 3 || inner.width < 10 {
             return;
         }
 
-        let ascii_bars = render_ascii_bars(bands, inner.height as usize);
-        let paragraph = Paragraph::new(ascii_bars)
-            .style(Style::default().fg(Color::LightGreen))
-            .alignment(Alignment::Center);
+        let lines = if is_playing && !bands.is_empty() {
+            render_spectrum_lines(bands, inner.height as usize, inner.width as usize)
+        } else {
+            render_standby_lines(inner.height as usize, inner.width as usize, &self.config.device_name)
+        };
 
+        let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
         f.render_widget(paragraph, inner);
     }
 
@@ -257,18 +266,19 @@ impl TuiApp {
     }
 
     /// Синтез живых полос спектрограммы для удаленного TUI-терминала
-    fn generate_live_bands(position_ms: u64) -> Vec<f32> {
-        let t = position_ms as f32 / 1000.0;
-        let mut bands = Vec::with_capacity(16);
-        for i in 0..16 {
+    fn generate_live_bands(&self, position_ms: u64, num_bands: usize) -> Vec<f32> {
+        let t = (position_ms as f32 / 1000.0) + self.start_time.elapsed().as_secs_f32();
+        let mut bands = Vec::with_capacity(num_bands);
+        for i in 0..num_bands {
             let fi = (i + 1) as f32;
-            let wave1 = (t * 3.5 * (1.0 + fi * 0.08) + fi * 0.7).sin();
-            let wave2 = (t * 7.0 - fi * 0.35).cos();
-            let wave3 = (t * 1.8 + fi * 1.1).sin();
+            let wave1 = (t * 3.5 * (1.0 + fi * 0.05) + fi * 0.6).sin();
+            let wave2 = (t * 6.5 - fi * 0.3).cos();
+            let wave3 = (t * 1.5 + fi * 1.2).sin();
+            let beat = ((t * 2.2).sin().powi(4) * 0.35).max(0.0);
 
-            let bass_boost = if i < 4 { 0.25 } else if i < 8 { 0.1 } else { 0.0 };
-            let val = ((wave1 * 0.4 + wave2 * 0.35 + wave3 * 0.25).abs() + bass_boost)
-                .clamp(0.04, 0.96);
+            let bass_boost = if i < num_bands / 4 { 0.3 + beat } else if i < num_bands / 2 { 0.15 } else { 0.05 };
+            let val = ((wave1 * 0.35 + wave2 * 0.3 + wave3 * 0.2).abs() + bass_boost)
+                .clamp(0.05, 0.98);
             bands.push(val);
         }
         bands

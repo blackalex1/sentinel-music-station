@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Метаданные текущего трека
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrackMeta {
+    #[serde(default)]
     pub id: i64,
     #[serde(default)]
     pub title: String,
@@ -16,16 +17,32 @@ pub struct TrackMeta {
     pub cover_url: Option<String>,
 }
 
+fn default_volume() -> f32 {
+    0.7
+}
+
+fn default_repeat() -> String {
+    "off".to_string()
+}
+
 /// Состояние плеера на колонке, передаваемое серверу
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerState {
+    #[serde(default)]
     pub is_playing: bool,
+    #[serde(default)]
     pub current_track: Option<TrackMeta>,
+    #[serde(default)]
     pub position_ms: u64,
+    #[serde(default)]
     pub duration_ms: u64,
+    #[serde(default = "default_volume")]
     pub volume: f32,
+    #[serde(default)]
     pub is_muted: bool,
+    #[serde(default = "default_repeat")]
     pub repeat_mode: String,
+    #[serde(default)]
     pub is_shuffle: bool,
     #[serde(default)]
     pub queue: Vec<TrackMeta>,
