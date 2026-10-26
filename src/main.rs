@@ -72,16 +72,43 @@ fn cleanup_stale_alsa_ipc() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Настройка логирования (RUST_LOG=info по умолчанию)
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,sentinel_station=debug"));
-
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
-        .init();
-
     let cli = Cli::parse();
+    let is_tui = matches!(cli.command, Some(Commands::Tui));
+
+    // Настройка логирования: в интерактивном TUI-режиме перенаправляем логи в файл,
+    // чтобы они не перебивали вывод Crossterm/Ratatui в SSH консоли
+    if is_tui {
+        let log_path = std::env::temp_dir().join("sentinel-station-tui.log");
+        if let Ok(log_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+        {
+            let env_filter = EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,sentinel_station=debug"));
+
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_writer(log_file)
+                .with_ansi(false)
+                .with_target(false)
+                .init();
+        } else {
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .init();
+        }
+    } else {
+        let env_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info,sentinel_station=debug"));
+
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .init();
+    }
+
     let cfg = StationConfig::load(cli.config.as_deref())
         .context("Ошибка инициализации файла конфигурации")?;
     let config = Arc::new(cfg);
@@ -337,12 +364,30 @@ async fn run_tui_mode(config: Arc<StationConfig>) -> Result<()> {
         }
     });
 
+    // Установка хука паники для гарантированного восстановления терминала
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+        original_hook(panic_info);
+    }));
+
     // Инициализация терминала Crossterm
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen, crossterm::cursor::Hide)?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::Hide
+    )?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
+    terminal.clear()?;
 
     let mut tui_app = TuiApp::new(
         tui_config,

@@ -55,7 +55,16 @@ impl TuiApp {
                 Vec::new()
             };
 
-            let bands = self.spectrum_analyzer.compute(&samples);
+            let bands = if !samples.is_empty() {
+                self.spectrum_analyzer.compute(&samples)
+            } else {
+                let state = self.state_rx.borrow();
+                if state.is_playing {
+                    Self::generate_live_bands(state.position_ms)
+                } else {
+                    vec![0.0; 16]
+                }
+            };
 
             terminal.draw(|f| {
                 self.draw(f, &bands);
@@ -72,6 +81,12 @@ impl TuiApp {
                         }
                         KeyCode::Char(' ') => {
                             let _ = self.command_tx.send(PlayerCommand::TogglePlay).await;
+                        }
+                        KeyCode::Char('n') | KeyCode::Right => {
+                            let _ = self.command_tx.send(PlayerCommand::Next).await;
+                        }
+                        KeyCode::Char('p') | KeyCode::Left => {
+                            let _ = self.command_tx.send(PlayerCommand::Prev).await;
                         }
                         KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Up => {
                             let current_vol = self.state_rx.borrow().volume;
@@ -224,6 +239,10 @@ impl TuiApp {
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" [Пробел] ", Style::default().fg(Color::Black).bg(Color::White)),
             Span::raw(" Пауза/Старт  "),
+            Span::styled(" [N/→] ", Style::default().fg(Color::Black).bg(Color::White)),
+            Span::raw(" След  "),
+            Span::styled(" [P/←] ", Style::default().fg(Color::Black).bg(Color::White)),
+            Span::raw(" Пред  "),
             Span::styled(" [+/-] ", Style::default().fg(Color::Black).bg(Color::White)),
             Span::raw(" Громкость  "),
             Span::styled(" [M] ", Style::default().fg(Color::Black).bg(Color::White)),
@@ -235,5 +254,23 @@ impl TuiApp {
         .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded));
 
         f.render_widget(help, area);
+    }
+
+    /// Синтез живых полос спектрограммы для удаленного TUI-терминала
+    fn generate_live_bands(position_ms: u64) -> Vec<f32> {
+        let t = position_ms as f32 / 1000.0;
+        let mut bands = Vec::with_capacity(16);
+        for i in 0..16 {
+            let fi = (i + 1) as f32;
+            let wave1 = (t * 3.5 * (1.0 + fi * 0.08) + fi * 0.7).sin();
+            let wave2 = (t * 7.0 - fi * 0.35).cos();
+            let wave3 = (t * 1.8 + fi * 1.1).sin();
+
+            let bass_boost = if i < 4 { 0.25 } else if i < 8 { 0.1 } else { 0.0 };
+            let val = ((wave1 * 0.4 + wave2 * 0.35 + wave3 * 0.25).abs() + bass_boost)
+                .clamp(0.04, 0.96);
+            bands.push(val);
+        }
+        bands
     }
 }
