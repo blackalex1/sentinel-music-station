@@ -105,6 +105,7 @@ impl VoiceInterceptor {
 
         let mut last_phrase = String::new();
         let mut last_phrase_time = Instant::now();
+        let mut in_call_or_alarm = false;
 
         let mut line_buffer = String::new();
 
@@ -127,6 +128,40 @@ impl VoiceInterceptor {
                 }
                 Ok(_) => {
                     let line = line_buffer.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let lower = line.to_lowercase();
+
+                    // 1. Автоматический перехват событий входящих/исходящих звонков и будильников
+                    if Self::is_call_or_alarm_start(&lower) {
+                        if !in_call_or_alarm {
+                            in_call_or_alarm = true;
+                            info!("📞 Обнаружен входящий звонок или будильник на Станции! (лог: {})", line);
+                            info!("🔓 Освобождаем кнопки для ответа на звонок и приостанавливаем Sentinel Music");
+                            let _ = self.is_active_tx.send(false);
+                            let player_tx = self.player_tx.clone();
+                            let display_tx = self.display_tx.clone();
+                            tokio::spawn(async move {
+                                let _ = display_tx.send(DisplayCommand::Standby).await;
+                                let _ = player_tx.send(PlayerCommand::Pause).await;
+                            });
+                        }
+                    } else if Self::is_call_or_alarm_end(&lower) {
+                        if in_call_or_alarm {
+                            in_call_or_alarm = false;
+                            info!("📴 Вызов или будильник на Станции завершен (лог: {})", line);
+                            info!("🔒 Возвращаем сенсорные кнопки под управление Sentinel Station");
+                            let _ = self.is_active_tx.send(true);
+                            let display_tx = self.display_tx.clone();
+                            tokio::spawn(async move {
+                                let _ = display_tx.send(DisplayCommand::Active).await;
+                            });
+                        }
+                    }
+
+                    // 2. Распознавание голосовых команд Алисы
                     if line.contains("recognizedPhrase='") {
                         if let Some(phrase) = Self::extract_recognized_phrase(line) {
                             let now = Instant::now();
@@ -147,6 +182,50 @@ impl VoiceInterceptor {
                 }
             }
         }
+    }
+
+    /// Проверка, указывает ли строка лога на входящий/исходящий звонок или срабатывание будильника
+    fn is_call_or_alarm_start(lower: &str) -> bool {
+        if Self::is_call_or_alarm_end(lower) {
+            return false;
+        }
+
+        // События звонков (PJSIP / WebRTC / PhoneCallsCapability)
+        lower.contains("incoming call")
+            || lower.contains("onincomingcall")
+            || lower.contains("new incoming call")
+            || lower.contains("accept incoming call")
+            || lower.contains("phone_calls_process_incoming_call")
+            || lower.contains("tincomingcallreceivedtypedcallback")
+            || lower.contains("call state changed: incoming")
+            || lower.contains("call state changed: calling")
+            || lower.contains("call state changed: early")
+            || lower.contains("outgoing call connected")
+            // События будильников и таймеров
+            || lower.contains("alarmfiredevent")
+            || lower.contains("alarm event fired")
+            || lower.contains("ontimerfired")
+    }
+
+    /// Проверка, указывает ли строка лога на окончание звонка или остановку будильника
+    fn is_call_or_alarm_end(lower: &str) -> bool {
+        // Завершение звонка
+        lower.contains("call ended")
+            || lower.contains("current call ended")
+            || lower.contains("incoming call ended")
+            || lower.contains("outgoing call ended")
+            || lower.contains("callishangedup")
+            || lower.contains("call state changed: disconnctd")
+            || lower.contains("disconnctd")
+            || lower.contains("incomingcalltimeout")
+            || lower.contains("phone_calls_ignore_incoming_call")
+            || lower.contains("reject_incoming_call")
+            // Остановка будильника или таймера
+            || lower.contains("alarm was already stopped")
+            || lower.contains("handlealarmstopdirective")
+            || lower.contains("tstopcurrentsoundalarmdirective")
+            || lower.contains("timer stop directive")
+            || lower.contains("close_screen_alarm_active_directive")
     }
 
     /// Извлечение распознанной фразы из строки лога maind

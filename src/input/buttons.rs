@@ -113,21 +113,19 @@ impl HardwareButtonController {
                 let mut buf = [0u8; 96];
 
                 loop {
-                    // Динамическое обновление захвата при смене режима активности
-                    if is_active_rx.has_changed().unwrap_or(false) {
-                        let active = *is_active_rx.borrow_and_update();
-                        if active && !current_grabbed {
-                            let ret = unsafe { libc::ioctl(fd, EVIOCGRAB, 1) };
-                            if ret == 0 {
-                                info!("🔒 Сенсорная панель снова захвачена под Sentinel (EVIOCGRAB)");
-                                current_grabbed = true;
-                            }
-                        } else if !active && current_grabbed {
-                            let ret = unsafe { libc::ioctl(fd, EVIOCGRAB, 0) };
-                            if ret == 0 {
-                                info!("🔓 Сенсорная панель освобождена для Алисы");
-                                current_grabbed = false;
-                            }
+                    // Динамическое обновление захвата при смене режима активности (звонок, Алиса, Sentinel)
+                    let active = *is_active_rx.borrow_and_update();
+                    if active && !current_grabbed {
+                        let ret = unsafe { libc::ioctl(fd, EVIOCGRAB, 1) };
+                        if ret == 0 {
+                            info!("🔒 Сенсорная панель снова захвачена под Sentinel (EVIOCGRAB)");
+                            current_grabbed = true;
+                        }
+                    } else if !active && current_grabbed {
+                        let ret = unsafe { libc::ioctl(fd, EVIOCGRAB, 0) };
+                        if ret == 0 {
+                            info!("🔓 Сенсорная панель освобождена для Алисы");
+                            current_grabbed = false;
                         }
                     }
 
