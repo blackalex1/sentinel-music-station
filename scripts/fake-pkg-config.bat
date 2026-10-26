@@ -13,5 +13,7 @@ if "%1"=="--atleast-pkgconfig-version" (
 if "%1"=="--atleast-version" (
     exit /b 0
 )
-echo -L"%~dp0..\libs\armv7" -lasound
+set "LIBDIR=%~dp0..\libs\armv7"
+set "LIBDIR=%LIBDIR:\=/%"
+echo -L%LIBDIR% -lasound
 exit /b 0

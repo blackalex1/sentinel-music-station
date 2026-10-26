@@ -26,7 +26,7 @@ use visualizer::DisplayManager;
 #[command(
     name = "sentinel-station",
     author = "Sentinel Music Ecosystem",
-    version = "0.1.0",
+    version,
     about = "Нативный демон воспроизведения Sentinel Music для умных колонок (Яндекс.Станция)"
 )]
 struct Cli {
@@ -216,7 +216,7 @@ async fn main() -> Result<()> {
 
 /// Запуск в режиме фонового демона
 async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandle) -> Result<()> {
-    info!("Запуск демона Sentinel Station v0.1.0 (ALSA Native)");
+    info!("Запуск демона Sentinel Station v{} (ALSA Native)", env!("CARGO_PKG_VERSION"));
     info!("Имя устройства в Sentinel Connect: '{}'", config.device_name);
     info!("Аудиовыход: '{}'", config.audio_device);
 
