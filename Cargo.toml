@@ -4,6 +4,7 @@ version = "0.0.2"
 edition = "2021"
 description = "Нативный легковесный клиент Sentinel Music для умных колонок (Яндекс Станция) на базе ALSA и Rust"
 authors = ["Sentinel Music Team"]
+license = "MIT"
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
