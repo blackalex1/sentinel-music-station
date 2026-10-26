@@ -1,6 +1,6 @@
 [package]
 name = "sentinel-station"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 description = "Нативный легковесный клиент Sentinel Music для умных колонок (Яндекс Станция) на базе ALSA и Rust"
 authors = ["Sentinel Music Team"]
