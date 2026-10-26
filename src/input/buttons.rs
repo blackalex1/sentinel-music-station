@@ -129,13 +129,13 @@ impl HardwareButtonController {
                         }
                     }
 
-                    // Таймаут poll 150 мс для периодической проверки флага активности
+                    // Таймаут poll 50 мс для мгновенной реакции на смену режима активности (звонок/будильник)
                     let mut pfd = libc::pollfd {
                         fd,
                         events: libc::POLLIN,
                         revents: 0,
                     };
-                    let poll_res = unsafe { libc::poll(&mut pfd, 1, 150) };
+                    let poll_res = unsafe { libc::poll(&mut pfd, 1, 50) };
                     if poll_res <= 0 || (pfd.revents & libc::POLLIN) == 0 {
                         continue;
                     }

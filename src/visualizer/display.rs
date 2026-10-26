@@ -19,6 +19,8 @@ pub enum DisplayCommand {
     Standby,
     Active,
     Flow,
+    PassThrough,
+    PassThroughResume,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +180,15 @@ impl DisplayManager {
                     DisplayCommand::Flow => {
                         clock_driver.invalidate();
                         transition_seq = Some(TransitionSequence::Flow(Instant::now()));
+                    }
+                    DisplayCommand::PassThrough => {
+                        transition_seq = None;
+                        ring_driver.turn_off();
+                        clock_driver.invalidate();
+                    }
+                    DisplayCommand::PassThroughResume => {
+                        transition_seq = None;
+                        clock_driver.invalidate();
                     }
                 }
             }

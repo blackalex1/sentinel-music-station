@@ -99,13 +99,38 @@ impl VoiceInterceptor {
             }
         };
 
+        let mut in_call_or_alarm = false;
+
+        // Проверяем последние 8 КБ лога, чтобы узнать, не идет ли уже звонок или будильник в момент запуска
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let check_offset = file_len.saturating_sub(8192);
+        let _ = file.seek(SeekFrom::Start(check_offset));
+        let mut init_reader = BufReader::new(&file);
+        let mut init_line = String::new();
+        while init_reader.read_line(&mut init_line).unwrap_or(0) > 0 {
+            let lower = init_line.to_lowercase();
+            if Self::is_call_or_alarm_start(&lower) {
+                in_call_or_alarm = true;
+            } else if Self::is_call_or_alarm_end(&lower) {
+                in_call_or_alarm = false;
+            }
+            init_line.clear();
+        }
+        if in_call_or_alarm {
+            info!("📞 При запуске обнаружен активный звонок или будильник/таймер — освобождаем кнопки для Алисы");
+            let _ = self.is_active_tx.send(false);
+            let display_tx = self.display_tx.clone();
+            tokio::spawn(async move {
+                let _ = display_tx.send(DisplayCommand::PassThrough).await;
+            });
+        }
+
         // Перемещаемся в конец файла, чтобы обрабатывать только новые голосовые события
         let _ = file.seek(SeekFrom::End(0));
         let mut reader = BufReader::new(file);
 
         let mut last_phrase = String::new();
         let mut last_phrase_time = Instant::now();
-        let mut in_call_or_alarm = false;
 
         let mut line_buffer = String::new();
 
@@ -134,35 +159,38 @@ impl VoiceInterceptor {
 
                     let lower = line.to_lowercase();
 
-                    // 1. Автоматический перехват событий входящих/исходящих звонков и будильников
+                    // 1. Автоматический перехват событий входящих/исходящих звонков и будильников/таймеров
                     if Self::is_call_or_alarm_start(&lower) {
                         if !in_call_or_alarm {
                             in_call_or_alarm = true;
-                            info!("📞 Обнаружен входящий звонок или будильник на Станции! (лог: {})", line);
-                            info!("🔓 Освобождаем кнопки для ответа на звонок и приостанавливаем Sentinel Music");
+                            info!("📞 Обнаружен звонок, будильник или таймер на Станции! (лог: {})", line);
+                            info!("🔓 Освобождаем кнопки для ответа/остановки и приостанавливаем Sentinel Music");
                             let _ = self.is_active_tx.send(false);
                             let player_tx = self.player_tx.clone();
                             let display_tx = self.display_tx.clone();
                             tokio::spawn(async move {
-                                let _ = display_tx.send(DisplayCommand::Standby).await;
+                                let _ = display_tx.send(DisplayCommand::PassThrough).await;
                                 let _ = player_tx.send(PlayerCommand::Pause).await;
                             });
                         }
                     } else if Self::is_call_or_alarm_end(&lower) {
                         if in_call_or_alarm {
                             in_call_or_alarm = false;
-                            info!("📴 Вызов или будильник на Станции завершен (лог: {})", line);
+                            info!("📴 Вызов, будильник или таймер на Станции завершен (лог: {})", line);
                             info!("🔒 Возвращаем сенсорные кнопки под управление Sentinel Station");
                             let _ = self.is_active_tx.send(true);
                             let display_tx = self.display_tx.clone();
                             tokio::spawn(async move {
-                                let _ = display_tx.send(DisplayCommand::Active).await;
+                                let _ = display_tx.send(DisplayCommand::PassThroughResume).await;
                             });
                         }
                     }
 
-                    // 2. Распознавание голосовых команд Алисы
+                    // 2. Распознавание голосовых команд Алисы (во время звонка или будильника не перехватываем)
                     if line.contains("recognizedPhrase='") {
+                        if in_call_or_alarm {
+                            continue;
+                        }
                         if let Some(phrase) = Self::extract_recognized_phrase(line) {
                             let now = Instant::now();
                             // Защита от дублирования одной и той же фразы в пределах 1 секунды
@@ -184,13 +212,13 @@ impl VoiceInterceptor {
         }
     }
 
-    /// Проверка, указывает ли строка лога на входящий/исходящий звонок или срабатывание будильника
+    /// Проверка, указывает ли строка лога на входящий/исходящий звонок или срабатывание будильника / таймера
     fn is_call_or_alarm_start(lower: &str) -> bool {
         if Self::is_call_or_alarm_end(lower) {
             return false;
         }
 
-        // События звонков (PJSIP / WebRTC / PhoneCallsCapability)
+        // 1. События звонков (PJSIP / WebRTC / PhoneCallsCapability)
         lower.contains("incoming call")
             || lower.contains("onincomingcall")
             || lower.contains("new incoming call")
@@ -201,15 +229,22 @@ impl VoiceInterceptor {
             || lower.contains("call state changed: calling")
             || lower.contains("call state changed: early")
             || lower.contains("outgoing call connected")
-            // События будильников и таймеров
+            || lower.contains("call_incoming.led")
+            || lower.contains("calls_ringing_incoming")
+            // 2. События будильников и таймеров
+            || lower.contains("timer.led")
+            || lower.contains("ringing.binscled")
+            || lower.contains("ringing.scled")
             || lower.contains("alarmfiredevent")
             || lower.contains("alarm event fired")
             || lower.contains("ontimerfired")
+            || lower.contains("processexpiredevent")
+            || (lower.contains("local_audio_file_play") && lower.contains("audiofileplayercapability"))
     }
 
-    /// Проверка, указывает ли строка лога на окончание звонка или остановку будильника
+    /// Проверка, указывает ли строка лога на окончание звонка или остановку будильника / таймера
     fn is_call_or_alarm_end(lower: &str) -> bool {
-        // Завершение звонка
+        // 1. Завершение звонка
         lower.contains("call ended")
             || lower.contains("current call ended")
             || lower.contains("incoming call ended")
@@ -220,11 +255,18 @@ impl VoiceInterceptor {
             || lower.contains("incomingcalltimeout")
             || lower.contains("phone_calls_ignore_incoming_call")
             || lower.contains("reject_incoming_call")
-            // Остановка будильника или таймера
+            || lower.contains("call_ended.led")
+            || lower.contains("calls_ended")
+            // 2. Остановка будильника или таймера
+            || lower.contains("timer_stop_directive")
+            || lower.contains("alarm_stop_directive")
+            || lower.contains("local_audio_file_stop")
             || lower.contains("alarm was already stopped")
             || lower.contains("handlealarmstopdirective")
+            || lower.contains("handletimerstopdirective")
             || lower.contains("tstopcurrentsoundalarmdirective")
             || lower.contains("timer stop directive")
+            || lower.contains("alarm is still playing after timeout")
             || lower.contains("close_screen_alarm_active_directive")
     }
 
@@ -361,24 +403,61 @@ impl VoiceInterceptor {
         }
 
         // 1. Включение музыки / запуск трека
-        if phrase == "включи музыку"
+        // Отсекаем не относящиеся к музыке команды: таймеры, будильники, умный дом, погоду, новости и звонки
+        let is_non_music = phrase.contains("таймер")
+            || phrase.contains("будильник")
+            || phrase.contains("напомин")
+            || phrase.contains("секундомер")
+            || phrase.contains("свет")
+            || phrase.contains("розетк")
+            || phrase.contains("чайник")
+            || phrase.contains("пылесос")
+            || phrase.contains("кондиционер")
+            || phrase.contains("телевизор")
+            || phrase.contains("люстр")
+            || phrase.contains("ночник")
+            || phrase.contains("яркость")
+            || phrase.contains("сценари")
+            || phrase.contains("радио")
+            || phrase.contains("сказк")
+            || phrase.contains("новости")
+            || phrase.contains("погод")
+            || phrase.contains("позвони")
+            || phrase.contains("шум");
+
+        let is_music_cmd = !is_non_music && (
+            phrase == "включи музыку"
             || phrase == "включи трек"
             || phrase == "включи песню"
             || phrase == "включи плейлист"
             || phrase == "поставь музыку"
             || phrase == "поставь песню"
             || phrase == "поставь трек"
+            || phrase == "поставь плейлист"
             || phrase == "запусти музыку"
+            || phrase == "запусти песню"
+            || phrase == "запусти трек"
             || phrase == "играй музыку"
             || phrase == "музыка"
             || phrase == "продолжи"
             || phrase == "продолжить"
             || phrase == "продолжи воспроизведение"
-            || phrase.starts_with("включи ")
-            || phrase.starts_with("поставь ")
-            || phrase.starts_with("запусти ")
-            || phrase.starts_with("играй ")
-        {
+            || phrase == "продолжай"
+            || phrase.starts_with("включи музыку")
+            || phrase.starts_with("поставь музыку")
+            || phrase.starts_with("запусти музыку")
+            || phrase.starts_with("играй музыку")
+            || phrase.starts_with("включи трек ")
+            || phrase.starts_with("поставь трек ")
+            || phrase.starts_with("запусти трек ")
+            || phrase.starts_with("включи песню ")
+            || phrase.starts_with("поставь песню ")
+            || phrase.starts_with("запусти песню ")
+            || phrase.starts_with("включи плейлист ")
+            || phrase.starts_with("поставь плейлист ")
+        );
+
+        if is_music_cmd {
             info!("🎵 Перехвачена команда воспроизведения: '{}'! Запуск Sentinel Music", phrase);
 
             let player_tx = self.player_tx.clone();
