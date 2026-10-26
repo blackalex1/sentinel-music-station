@@ -26,6 +26,8 @@ pub struct AudioPlayer {
     jack_state: Option<bool>,
     current_audio_data: Option<bytes::Bytes>,
     current_track_id: Option<i64>,
+    is_flow_active: bool,
+    recent_flow_ids: Vec<i64>,
 }
 
 impl AudioPlayer {
@@ -59,6 +61,8 @@ impl AudioPlayer {
             jack_state,
             current_audio_data: None,
             current_track_id: None,
+            is_flow_active: false,
+            recent_flow_ids: Vec::new(),
         })
     }
 
@@ -76,6 +80,8 @@ impl AudioPlayer {
                     match cmd {
                         PlayerCommand::PlayTrack { track_id, title, artist, duration_ms, position_ms, auto_play, queue } => {
                             info!("Запуск трека ID: {} - '{}' / '{}' (позиция: {} мс, auto_play: {})", track_id, title, artist, position_ms, auto_play);
+                            self.is_flow_active = false;
+                            self.recent_flow_ids.clear();
                             self.queue.set_queue(queue, track_id);
 
                             match self.load_and_play_track_at(track_id, position_ms, auto_play).await {
@@ -85,6 +91,7 @@ impl AudioPlayer {
 
                                     let mut state = self.state_tx.borrow().clone();
                                     state.is_playing = auto_play;
+                                    state.is_flow = false;
                                     state.position_ms = position_ms;
                                     state.duration_ms = duration_ms;
                                     state.queue = self.queue.tracks();
@@ -259,25 +266,97 @@ impl AudioPlayer {
                             state.volume = clamped;
                             let _ = self.state_tx.send(state);
                         }
-                        PlayerCommand::Next => {
-                            info!("Команда переключения на следующий трек (Next)");
-                            if self.queue.is_empty() {
-                                if let Ok(tracks) = self.loader.fetch_server_tracks().await {
-                                    self.queue.set_queue(tracks, 0);
+                        PlayerCommand::StartFlow => {
+                            info!("🌊 Активация режима Поток (Flow / Vibe Stream)");
+                            self.is_flow_active = true;
+
+                            let cur_id = self.state_tx.borrow().current_track.as_ref().map(|t| t.id);
+                            if let Some(id) = cur_id {
+                                if !self.recent_flow_ids.contains(&id) {
+                                    self.recent_flow_ids.push(id);
                                 }
                             }
-                            if let Some(next_track) = self.queue.next() {
-                                let dur_ms = next_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
-                                if let Ok(()) = self.load_and_play_track(next_track.id).await {
-                                    track_started_at = Some(Instant::now());
-                                    accumulated_position = Duration::ZERO;
-                                    let mut state = self.state_tx.borrow().clone();
-                                    state.is_playing = true;
-                                    state.position_ms = 0;
-                                    state.duration_ms = dur_ms;
-                                    state.current_track = Some(next_track);
-                                    state.queue = self.queue.tracks();
-                                    let _ = self.state_tx.send(state);
+
+                            match self.loader.fetch_next_stream_track(cur_id, &self.recent_flow_ids, "default").await {
+                                Ok(next_track) => {
+                                    info!("🎵 Получен трек для Потока: #{} - '{}' / '{}'", next_track.id, next_track.title, next_track.artist);
+                                    self.recent_flow_ids.push(next_track.id);
+                                    if self.recent_flow_ids.len() > 40 {
+                                        self.recent_flow_ids.remove(0);
+                                    }
+
+                                    let dur_ms = next_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
+                                    if let Ok(()) = self.load_and_play_track(next_track.id).await {
+                                        track_started_at = Some(Instant::now());
+                                        accumulated_position = Duration::ZERO;
+                                        let mut state = self.state_tx.borrow().clone();
+                                        state.is_playing = true;
+                                        state.is_flow = true;
+                                        state.position_ms = 0;
+                                        state.duration_ms = dur_ms;
+                                        state.current_track = Some(next_track.clone());
+                                        state.queue = vec![next_track];
+                                        let _ = self.state_tx.send(state);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Не удалось получить следующий трек Потока: {:#}", e);
+                                }
+                            }
+                        }
+                        PlayerCommand::Next => {
+                            info!("Команда переключения на следующий трек (Next)");
+                            if self.is_flow_active {
+                                let cur_id = self.state_tx.borrow().current_track.as_ref().map(|t| t.id);
+                                if let Some(id) = cur_id {
+                                    if !self.recent_flow_ids.contains(&id) {
+                                        self.recent_flow_ids.push(id);
+                                    }
+                                }
+                                match self.loader.fetch_next_stream_track(cur_id, &self.recent_flow_ids, "default").await {
+                                    Ok(next_track) => {
+                                        info!("🌊 [Поток] Переход к следующему треку: #{} - '{}'", next_track.id, next_track.title);
+                                        self.recent_flow_ids.push(next_track.id);
+                                        if self.recent_flow_ids.len() > 40 {
+                                            self.recent_flow_ids.remove(0);
+                                        }
+                                        let dur_ms = next_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
+                                        if let Ok(()) = self.load_and_play_track(next_track.id).await {
+                                            track_started_at = Some(Instant::now());
+                                            accumulated_position = Duration::ZERO;
+                                            let mut state = self.state_tx.borrow().clone();
+                                            state.is_playing = true;
+                                            state.is_flow = true;
+                                            state.position_ms = 0;
+                                            state.duration_ms = dur_ms;
+                                            state.current_track = Some(next_track.clone());
+                                            state.queue = vec![next_track];
+                                            let _ = self.state_tx.send(state);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Ошибка получения следующего трека Потока: {:#}", e);
+                                    }
+                                }
+                            } else {
+                                if self.queue.is_empty() {
+                                    if let Ok(tracks) = self.loader.fetch_server_tracks().await {
+                                        self.queue.set_queue(tracks, 0);
+                                    }
+                                }
+                                if let Some(next_track) = self.queue.next() {
+                                    let dur_ms = next_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
+                                    if let Ok(()) = self.load_and_play_track(next_track.id).await {
+                                        track_started_at = Some(Instant::now());
+                                        accumulated_position = Duration::ZERO;
+                                        let mut state = self.state_tx.borrow().clone();
+                                        state.is_playing = true;
+                                        state.position_ms = 0;
+                                        state.duration_ms = dur_ms;
+                                        state.current_track = Some(next_track);
+                                        state.queue = self.queue.tracks();
+                                        let _ = self.state_tx.send(state);
+                                    }
                                 }
                             }
                         }
@@ -364,6 +443,41 @@ impl AudioPlayer {
                                         state.duration_ms = dur_ms;
                                         let _ = self.state_tx.send(state);
                                         continue;
+                                    }
+                                }
+                            }
+
+                            // Автоматический переход к следующему треку в бесконечном Потоке (Flow)
+                            if self.is_flow_active {
+                                let cur_id = state.current_track.as_ref().map(|t| t.id);
+                                if let Some(id) = cur_id {
+                                    if !self.recent_flow_ids.contains(&id) {
+                                        self.recent_flow_ids.push(id);
+                                    }
+                                }
+                                match self.loader.fetch_next_stream_track(cur_id, &self.recent_flow_ids, "default").await {
+                                    Ok(next_track) => {
+                                        info!("🌊 [Поток: автопереход] Запуск следующего трека: #{} - '{}'", next_track.id, next_track.title);
+                                        self.recent_flow_ids.push(next_track.id);
+                                        if self.recent_flow_ids.len() > 40 {
+                                            self.recent_flow_ids.remove(0);
+                                        }
+                                        let dur_ms = next_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
+                                        if let Ok(()) = self.load_and_play_track(next_track.id).await {
+                                            track_started_at = Some(Instant::now());
+                                            accumulated_position = Duration::ZERO;
+                                            state.is_playing = true;
+                                            state.is_flow = true;
+                                            state.position_ms = 0;
+                                            state.duration_ms = dur_ms;
+                                            state.current_track = Some(next_track.clone());
+                                            state.queue = vec![next_track];
+                                            let _ = self.state_tx.send(state);
+                                            continue;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Ошибка автоперехода в Потоке: {:#}", e);
                                     }
                                 }
                             }

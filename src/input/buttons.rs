@@ -51,6 +51,7 @@ pub struct HardwareButtonController {
     cmd_tx: mpsc::Sender<PlayerCommand>,
     state_rx: watch::Receiver<PlayerState>,
     display_tx: mpsc::Sender<DisplayCommand>,
+    is_active_rx: watch::Receiver<bool>,
 }
 
 impl HardwareButtonController {
@@ -59,12 +60,14 @@ impl HardwareButtonController {
         cmd_tx: mpsc::Sender<PlayerCommand>,
         state_rx: watch::Receiver<PlayerState>,
         display_tx: mpsc::Sender<DisplayCommand>,
+        is_active_rx: watch::Receiver<bool>,
     ) -> Self {
         Self {
             device_path: device_path.into(),
             cmd_tx,
             state_rx,
             display_tx,
+            is_active_rx,
         }
     }
 
@@ -80,6 +83,7 @@ impl HardwareButtonController {
 
         // 1. Поток прямого чтения из /dev/input/event0
         let thread_path = path_str.clone();
+        let mut is_active_rx = self.is_active_rx.clone();
         std::thread::Builder::new()
             .name("sentinel-evdev".to_string())
             .spawn(move || {
@@ -91,20 +95,53 @@ impl HardwareButtonController {
                     }
                 };
 
-                // Эксклюзивный захват устройства ввода через ioctl(EVIOCGRAB, 1).
-                // Блокирует передачу событий сенсорных кнопок сторонним процессам (platformd / Алиса).
                 let fd = file.as_raw_fd();
-                let grab_ret = unsafe { libc::ioctl(fd, EVIOCGRAB, 1) };
-                if grab_ret == 0 {
-                    info!("🔒 Сенсорная панель успешно перехвачена монопольно (EVIOCGRAB). Нажатия кнопок изолированы от Алисы!");
-                } else {
-                    warn!("Не удалось монопольно захватить {}: код ошибки {}, {}", thread_path, grab_ret, std::io::Error::last_os_error());
+                let mut current_grabbed = false;
+
+                // Начальный захват устройства, если Sentinel активен
+                if *is_active_rx.borrow() {
+                    let grab_ret = unsafe { libc::ioctl(fd, EVIOCGRAB, 1) };
+                    if grab_ret == 0 {
+                        info!("🔒 Сенсорная панель успешно перехвачена монопольно (EVIOCGRAB). Нажатия кнопок изолированы от Алисы!");
+                        current_grabbed = true;
+                    } else {
+                        warn!("Не удалось монопольно захватить {}: код ошибки {}, {}", thread_path, grab_ret, std::io::Error::last_os_error());
+                    }
                 }
 
                 info!("Чтение сенсорных кнопок запущено на {}", thread_path);
                 let mut buf = [0u8; 96];
 
                 loop {
+                    // Динамическое обновление захвата при смене режима активности
+                    if is_active_rx.has_changed().unwrap_or(false) {
+                        let active = *is_active_rx.borrow_and_update();
+                        if active && !current_grabbed {
+                            let ret = unsafe { libc::ioctl(fd, EVIOCGRAB, 1) };
+                            if ret == 0 {
+                                info!("🔒 Сенсорная панель снова захвачена под Sentinel (EVIOCGRAB)");
+                                current_grabbed = true;
+                            }
+                        } else if !active && current_grabbed {
+                            let ret = unsafe { libc::ioctl(fd, EVIOCGRAB, 0) };
+                            if ret == 0 {
+                                info!("🔓 Сенсорная панель освобождена для Алисы");
+                                current_grabbed = false;
+                            }
+                        }
+                    }
+
+                    // Таймаут poll 150 мс для периодической проверки флага активности
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let poll_res = unsafe { libc::poll(&mut pfd, 1, 150) };
+                    if poll_res <= 0 || (pfd.revents & libc::POLLIN) == 0 {
+                        continue;
+                    }
+
                     let n = match file.read(&mut buf) {
                         Ok(0) => {
                             std::thread::sleep(Duration::from_millis(100));
@@ -144,6 +181,11 @@ impl HardwareButtonController {
                         };
 
                         if type_ == EV_KEY {
+                            // Если деактивирован, не пересылаем нажатия в Sentinel
+                            if !*is_active_rx.borrow() {
+                                offset += event_size;
+                                continue;
+                            }
                             if raw_tx.blocking_send((code, value)).is_err() {
                                 return;
                             }
@@ -318,7 +360,13 @@ impl HardwareButtonController {
                             let _ = cmd_tx.send(PlayerCommand::SetVolume { volume: new_vol }).await;
                         }
                         TouchPad::Center => {
-                            info!("🔘 Сенсорная кнопка: Пауза / Воспроизведение");
+                            let will_play = !state_rx.borrow().is_playing;
+                            info!("🔘 Сенсорная кнопка: {}", if will_play { "Воспроизведение (Play)" } else { "Пауза (Pause)" });
+                            if will_play {
+                                let _ = display_tx.send(DisplayCommand::Play).await;
+                            } else {
+                                let _ = display_tx.send(DisplayCommand::Pause).await;
+                            }
                             let _ = cmd_tx.send(PlayerCommand::TogglePlay).await;
                         }
                     }

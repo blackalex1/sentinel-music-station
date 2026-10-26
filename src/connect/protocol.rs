@@ -31,6 +31,8 @@ pub struct PlayerState {
     #[serde(default)]
     pub is_playing: bool,
     #[serde(default)]
+    pub is_flow: bool,
+    #[serde(default)]
     pub current_track: Option<TrackMeta>,
     #[serde(default)]
     pub position_ms: u64,
@@ -52,6 +54,7 @@ impl Default for PlayerState {
     fn default() -> Self {
         Self {
             is_playing: false,
+            is_flow: false,
             current_track: None,
             position_ms: 0,
             duration_ms: 0,
@@ -145,4 +148,5 @@ pub enum PlayerCommand {
         auto_play: bool,
         queue: Vec<TrackMeta>,
     },
+    StartFlow,
 }

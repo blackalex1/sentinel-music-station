@@ -20,7 +20,8 @@ use config::StationConfig;
 use connect::{ConnectClient, PlayerCommand, PlayerState};
 use input::{HardwareButtonController, VoiceInterceptor};
 use tui::TuiApp;
-use visualizer::DisplayManager;
+use visualizer::led_clock::TrackAnimStyle;
+use visualizer::{DisplayCommand, DisplayManager};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -157,6 +158,8 @@ async fn main() -> Result<()> {
                 let brightness = config.display_brightness;
                 let tz_offset = config.timezone_offset_hours;
                 let (_, dummy_rx) = mpsc::channel(4);
+                let (_, is_active_rx) = watch::channel(true);
+                let track_style = TrackAnimStyle::from_str_opt(&config.track_animation_style);
                 tokio::spawn(async move {
                     let display_mgr = DisplayManager::new(
                         sample_buf_clone,
@@ -164,6 +167,8 @@ async fn main() -> Result<()> {
                         dummy_rx,
                         brightness,
                         tz_offset,
+                        is_active_rx,
+                        track_style,
                     );
                     display_mgr.run_loop().await;
                 });
@@ -220,10 +225,31 @@ async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandl
     info!("Имя устройства в Sentinel Connect: '{}'", config.device_name);
     info!("Аудиовыход: '{}'", config.audio_device);
 
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (cmd_tx, mut incoming_cmd_rx) = mpsc::channel::<PlayerCommand>(64);
+    let (player_cmd_tx, player_cmd_rx) = mpsc::channel(64);
     let (state_tx, state_rx) = watch::channel(PlayerState::default());
     let (is_connected_tx, _) = watch::channel(false);
     let (display_tx, display_rx) = mpsc::channel(32);
+    let (is_active_tx, is_active_rx) = watch::channel(true);
+
+    // Автоматическое пробуждение Sentinel при получении команды воспроизведения с телефона/веб-плеера
+    let is_active_tx_clone = is_active_tx.clone();
+    let display_tx_clone = display_tx.clone();
+    tokio::spawn(async move {
+        while let Some(cmd) = incoming_cmd_rx.recv().await {
+            if matches!(cmd, PlayerCommand::PlayTrack { .. } | PlayerCommand::Play | PlayerCommand::StartFlow) {
+                if !*is_active_tx_clone.borrow() {
+                    info!("⚡ Удаленная команда запуска трека/Потока: автоматическое пробуждение Sentinel Station!");
+                    let _ = is_active_tx_clone.send(true);
+                    VoiceInterceptor::stop_alice_playback();
+                    let _ = display_tx_clone.send(DisplayCommand::Active).await;
+                }
+            }
+            if player_cmd_tx.send(cmd).await.is_err() {
+                break;
+            }
+        }
+    });
 
     let sample_buffer = Arc::new(Mutex::new(Vec::with_capacity(4096)));
 
@@ -231,7 +257,7 @@ async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandl
     let mut player = AudioPlayer::new(
         config.clone(),
         stream_handle,
-        cmd_rx,
+        player_cmd_rx,
         state_tx,
         sample_buffer.clone(),
     )?;
@@ -242,6 +268,8 @@ async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandl
         let state_rx_clone = state_rx.clone();
         let brightness = config.display_brightness;
         let tz_offset = config.timezone_offset_hours;
+        let is_active_rx_clone = is_active_rx.clone();
+        let track_style = TrackAnimStyle::from_str_opt(&config.track_animation_style);
         tokio::spawn(async move {
             let display_mgr = DisplayManager::new(
                 sample_buf_clone,
@@ -249,8 +277,15 @@ async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandl
                 display_rx,
                 brightness,
                 tz_offset,
+                is_active_rx_clone,
+                track_style,
             );
             display_mgr.run_loop().await;
+        });
+
+        let display_tx_init = display_tx.clone();
+        tokio::spawn(async move {
+            let _ = display_tx_init.send(DisplayCommand::Active).await;
         });
     }
 
@@ -261,6 +296,7 @@ async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandl
             cmd_tx.clone(),
             state_rx.clone(),
             display_tx.clone(),
+            is_active_rx.clone(),
         );
         button_controller.start();
     }
@@ -270,6 +306,7 @@ async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandl
         cmd_tx.clone(),
         state_rx.clone(),
         display_tx.clone(),
+        is_active_tx.clone(),
     );
     voice_interceptor.start();
 
@@ -349,6 +386,7 @@ async fn run_tui_mode(config: Arc<StationConfig>) -> Result<()> {
                 PlayerCommand::SetShuffle { enabled } => ("SHUFFLE", serde_json::json!({ "enabled": enabled })),
                 PlayerCommand::SetRepeat { mode } => ("REPEAT", serde_json::json!({ "mode": mode })),
                 PlayerCommand::PlayTrack { track_id, .. } => ("PLAY_TRACK", serde_json::json!({ "track_id": track_id })),
+                PlayerCommand::StartFlow => ("START_FLOW", serde_json::json!({})),
             };
 
             let mut req = http_client.post(&command_endpoint)

@@ -103,6 +103,9 @@ impl TuiApp {
                             let new_vol = if current_vol > 0.0 { 0.0 } else { 0.7 };
                             let _ = self.command_tx.send(PlayerCommand::SetVolume { volume: new_vol }).await;
                         }
+                        KeyCode::Char('f') => {
+                            let _ = self.command_tx.send(PlayerCommand::StartFlow).await;
+                        }
                         _ => {}
                     }
                 }

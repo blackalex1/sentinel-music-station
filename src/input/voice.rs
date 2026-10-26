@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::connect::protocol::{PlayerCommand, PlayerState};
 use crate::visualizer::DisplayCommand;
@@ -13,6 +13,7 @@ pub struct VoiceInterceptor {
     player_tx: mpsc::Sender<PlayerCommand>,
     state_rx: watch::Receiver<PlayerState>,
     display_tx: mpsc::Sender<DisplayCommand>,
+    is_active_tx: watch::Sender<bool>,
     log_path: PathBuf,
 }
 
@@ -21,11 +22,14 @@ impl VoiceInterceptor {
         player_tx: mpsc::Sender<PlayerCommand>,
         state_rx: watch::Receiver<PlayerState>,
         display_tx: mpsc::Sender<DisplayCommand>,
+        is_active_tx: watch::Sender<bool>,
     ) -> Self {
+        Self::ensure_mediad_running();
         Self {
             player_tx,
             state_rx,
             display_tx,
+            is_active_tx,
             log_path: PathBuf::from("/data/quasar/daemons_logs/maind.log"),
         }
     }
@@ -48,25 +52,28 @@ impl VoiceInterceptor {
         None
     }
 
-    /// Блокировка (заморозка) воспроизведения Яндекс.Музыки через SIGSTOP к mediad
-    pub fn suspend_yandex_music() {
-        if let Some(pid) = Self::find_mediad_pid() {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGSTOP);
-            }
-            info!("🔇 Яндекс.Музыка заблокирована (mediad PID {} заморожен через SIGSTOP)", pid);
-        }
-    }
-
-    /// Разморозка mediad через SIGCONT (если понадобится штатное воспроизведение)
-    #[allow(dead_code)]
-    pub fn resume_yandex_music() {
+    /// Проверка и разморозка mediad через SIGCONT (на случай, если он был заморожен предыдущей версией)
+    pub fn ensure_mediad_running() {
         if let Some(pid) = Self::find_mediad_pid() {
             unsafe {
                 libc::kill(pid as i32, libc::SIGCONT);
             }
-            info!("🔊 mediad PID {} разморожен (SIGCONT)", pid);
         }
+    }
+
+    /// Безопасная остановка воспроизведения и отмена диалога Алисы через Quasar CLI
+    /// (Не замораживает mediad через SIGSTOP, предотвращая зависание экрана и IPC)
+    pub fn stop_alice_playback() {
+        tokio::spawn(async {
+            let res = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg("(sleep 0.1; echo o; echo c; sleep 0.2; echo x) | LD_LIBRARY_PATH=/system/vendor/quasar/libs /system/vendor/quasar/maind --cli >/dev/null 2>&1")
+                .status()
+                .await;
+            if let Ok(status) = res {
+                debug!("Штатное воспроизведение и диалог Алисы сброшены (code: {:?})", status.code());
+            }
+        });
     }
 
     /// Запуск фонового мониторинга журнала голосового ввода
@@ -148,17 +155,131 @@ impl VoiceInterceptor {
         let start = line.find(pattern)? + pattern.len();
         let rest = &line[start..];
         let end = rest.find('\'')?;
-        let raw = &rest[..end].trim();
+        let raw = rest[..end].trim();
         if raw.is_empty() {
             None
         } else {
-            Some(raw.to_lowercase())
+            let mut lower = raw.to_lowercase();
+            // Срезаем префикс обращения ("алиса ", "яндекс "), если он попал в распознанную фразу
+            if lower.starts_with("алиса ") {
+                lower = lower["алиса ".len()..].trim().to_string();
+            } else if lower.starts_with("яндекс ") {
+                lower = lower["яндекс ".len()..].trim().to_string();
+            }
+            Some(lower)
         }
     }
 
     /// Обработка и маршрутизация распознанной голосовой фразы
     fn handle_voice_phrase(&self, phrase: &str) {
         info!("🗣️ Распознана голосовая фраза Алисы: '{}'", phrase);
+
+        // 0. Деактивация / переход Sentinel в режим ожидания (Passthrough)
+        if phrase == "выключи сентинел"
+            || phrase == "отключи сентинел"
+            || phrase == "деактивируй сентинел"
+            || phrase == "усыпи сентинел"
+            || phrase == "стоп сентинел"
+            || phrase == "режим алисы"
+            || phrase == "переключи на алису"
+            || phrase == "верни алису"
+            || phrase == "выключи sentinel"
+            || phrase == "отключи sentinel"
+            || phrase == "деактивируй sentinel"
+            || phrase == "стоп sentinel"
+            || phrase == "режим яндекс"
+            || phrase == "верни яндекс"
+        {
+            info!("💤 Голосовая команда: ДЕАКТИВАЦИЯ Sentinel Station (переход в режим ожидания/Алисы)");
+            Self::stop_alice_playback();
+            let _ = self.is_active_tx.send(false);
+
+            let player_tx = self.player_tx.clone();
+            let display_tx = self.display_tx.clone();
+            tokio::spawn(async move {
+                let _ = display_tx.send(DisplayCommand::Standby).await;
+                let _ = player_tx.send(PlayerCommand::Pause).await;
+            });
+            return;
+        }
+
+        // 0.1. Активация / пробуждение Sentinel Station
+        if phrase == "включи сентинел"
+            || phrase == "запусти сентинел"
+            || phrase == "активируй сентинел"
+            || phrase == "разбуди сентинел"
+            || phrase == "режим сентинел"
+            || phrase == "переключи на сентинел"
+            || phrase == "верни сентинел"
+            || phrase == "сентинел"
+            || phrase == "включи sentinel"
+            || phrase == "запусти sentinel"
+            || phrase == "активируй sentinel"
+            || phrase == "разбуди sentinel"
+            || phrase == "режим sentinel"
+            || phrase == "переключи на sentinel"
+            || phrase == "верни sentinel"
+            || phrase == "sentinel"
+        {
+            info!("⚡ Голосовая команда: АКТИВАЦИЯ Sentinel Station (возврат управления плеером)");
+            let _ = self.is_active_tx.send(true);
+            Self::stop_alice_playback();
+
+            let display_tx = self.display_tx.clone();
+            tokio::spawn(async move {
+                let _ = display_tx.send(DisplayCommand::Active).await;
+            });
+            return;
+        }
+
+        // 0.2. Запуск умного бесконечного Потока (Flow)
+        let is_flow_cmd = phrase == "поток"
+            || phrase == "мой поток"
+            || phrase == "музыкальный поток"
+            || phrase == "поток музыки"
+            || phrase.starts_with("включи поток")
+            || phrase.starts_with("запусти поток")
+            || phrase.starts_with("мой поток")
+            || phrase.starts_with("включи мой поток")
+            || phrase.starts_with("запусти мой поток");
+
+        if is_flow_cmd {
+            let was_active = *self.is_active_tx.borrow();
+            if !was_active {
+                info!("⚡ Голосовая команда запуска Потока пробуждает Sentinel Station!");
+                let _ = self.is_active_tx.send(true);
+            }
+
+            info!("🌊 Перехвачена голосовая команда запуска Потока: '{}'", phrase);
+            Self::stop_alice_playback();
+
+            // Воспроизводим локальное подтверждение "Включаю Поток."
+            tokio::spawn(async move {
+                let sound_path = "/data/opt/sentinel-station/sounds/flow_start.wav";
+                if std::path::Path::new(sound_path).exists() {
+                    let _ = tokio::process::Command::new("aplay")
+                        .arg("-D")
+                        .arg("default")
+                        .arg(sound_path)
+                        .status()
+                        .await;
+                }
+            });
+
+            let player_tx = self.player_tx.clone();
+            let display_tx = self.display_tx.clone();
+            tokio::spawn(async move {
+                let _ = display_tx.send(DisplayCommand::Flow).await;
+                let _ = player_tx.send(PlayerCommand::StartFlow).await;
+            });
+            return;
+        }
+
+        // Если Sentinel деактивирован, не перехватываем музыку и громкость — отдаем штатной Алисе!
+        if !*self.is_active_tx.borrow() {
+            info!("ℹ️ Sentinel в спящем режиме. Запрос '{}' передан штатной Алисе.", phrase);
+            return;
+        }
 
         // 1. Включение музыки / запуск трека
         if phrase == "включи музыку"
@@ -185,9 +306,10 @@ impl VoiceInterceptor {
             let display_tx = self.display_tx.clone();
 
             // Даем Алисе 2.2 секунды, чтобы она полностью закончила фразу ("Включаю музыку"),
-            // после чего плавно и без наложения стартует трек из Sentinel Music
+            // после чего отменяем воспроизведение в Яндекс.Музыке и запускаем трек в Sentinel
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(2200)).await;
+                Self::stop_alice_playback();
                 let _ = display_tx.send(DisplayCommand::Play).await;
                 let _ = player_tx.send(PlayerCommand::Play).await;
             });

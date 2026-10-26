@@ -227,6 +227,7 @@ impl ConnectClient {
             "STOP" => Some(PlayerCommand::Stop),
             "NEXT" => Some(PlayerCommand::Next),
             "PREV" => Some(PlayerCommand::Prev),
+            "START_FLOW" | "FLOW" | "START_STREAM" | "STREAM" => Some(PlayerCommand::StartFlow),
             "SEEK" => {
                 let pos_ms = payload.get("position_ms")
                     .and_then(|v| {

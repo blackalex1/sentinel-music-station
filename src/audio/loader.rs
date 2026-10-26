@@ -67,4 +67,43 @@ impl TrackLoader {
             anyhow::bail!("Сервер вернул статус HTTP {} при получении списка треков", response.status());
         }
     }
+
+    /// Запрос следующего рекомендованного трека для бесконечного режима Поток (Flow)
+    pub async fn fetch_next_stream_track(
+        &self,
+        current_track_id: Option<i64>,
+        recent_ids: &[i64],
+        mood: &str,
+    ) -> Result<TrackMeta> {
+        let mut url = format!(
+            "{}/api/stream/next?mood={}&discovery_ratio=0.2",
+            self.config.server_url.trim_end_matches('/'),
+            mood
+        );
+        if let Some(id) = current_track_id {
+            url.push_str(&format!("&current_track_id={}", id));
+        }
+        if !recent_ids.is_empty() {
+            let ids_str = recent_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+            url.push_str(&format!("&recent_ids={}", ids_str));
+        }
+
+        info!("Запрос трека Потока с: {}", url);
+        let mut request = self.http_client.get(&url);
+        if !self.config.auth_token.is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", self.config.auth_token));
+        }
+
+        let response = request.send().await
+            .with_context(|| format!("Не удалось отправить запрос к {}", url))?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Сервер вернул статус HTTP {} при получении трека Потока", response.status());
+        }
+
+        let track: TrackMeta = response.json().await
+            .context("Ошибка разбора JSON трека Потока от сервера")?;
+
+        Ok(track)
+    }
 }

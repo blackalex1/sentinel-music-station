@@ -1,6 +1,28 @@
 use std::path::PathBuf;
 use tracing::{debug, info};
 
+/// Стиль анимации переключения треков
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackAnimStyle {
+    Curtain,
+    Tape,
+    Slot,
+    Chevron,
+    Random,
+}
+
+impl TrackAnimStyle {
+    pub fn from_str_opt(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "curtain" | "scanner" | "1" => Self::Curtain,
+            "tape" | "cassette" | "4" => Self::Tape,
+            "slot" | "roll" | "5" => Self::Slot,
+            "chevron" | "arrow" | "arrows" | "2" => Self::Chevron,
+            _ => Self::Random,
+        }
+    }
+}
+
 /// Сегменты одного 7-сегментного индикатора
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DigitSegments {
@@ -47,11 +69,131 @@ pub fn char_to_segments(ch: char) -> DigitSegments {
         'U' | 'u' => DigitSegments { a: false, b: true, c: true, d: true, e: true, f: true, g: false },
         'S' | 's' => DigitSegments { a: true, b: false, c: true, d: true, e: false, f: true, g: true },
         'E' | 'e' => DigitSegments { a: true, b: false, c: false, d: true, e: true, f: true, g: true },
+        'O' | 'o' => DigitSegments { a: true, b: true, c: true, d: true, e: true, f: true, g: false },
+        'F' | 'f' => DigitSegments { a: true, b: false, c: false, d: false, e: true, f: true, g: true },
+        'N' | 'n' => DigitSegments { a: false, b: false, c: true, d: false, e: true, f: false, g: true },
+        'T' | 't' => DigitSegments { a: false, b: false, c: false, d: true, e: true, f: true, g: true },
+        'L' | 'l' => DigitSegments { a: false, b: false, c: false, d: true, e: true, f: true, g: false },
+        'I' | 'i' => DigitSegments { a: false, b: true, c: true, d: false, e: false, f: false, g: false },
+        'C' | 'c' => DigitSegments { a: true, b: false, c: false, d: true, e: true, f: true, g: false },
+        'D' | 'd' => DigitSegments { a: false, b: true, c: true, d: true, e: true, f: false, g: true },
+        'W' | 'w' => DigitSegments { a: false, b: false, c: true, d: true, e: true, f: false, g: true },
+        'V' | 'v' => DigitSegments { a: false, b: false, c: true, d: true, e: true, f: false, g: false },
+        'B' | 'b' => DigitSegments { a: false, b: false, c: true, d: true, e: true, f: true, g: true },
+        'R' | 'r' => DigitSegments { a: false, b: false, c: false, d: false, e: true, f: false, g: true },
+        ' ' => DigitSegments::default(),
         _ => DigitSegments::default(),
     }
 }
 
 impl DisplayFrame {
+    /// Текстовая надпись длиной до 4 символов (например " OFF", "  ON", "SENT")
+    pub fn text(s: &str) -> Self {
+        let mut frame = Self::default();
+        let chars: Vec<char> = s.chars().collect();
+        for i in 0..4 {
+            if i < chars.len() {
+                frame.digits[i] = char_to_segments(chars[i]);
+            }
+        }
+        frame
+    }
+
+    /// Бегущая строка: окно из 4 символов со смещением `window`
+    pub fn marquee(full_text: &str, window: usize) -> Self {
+        let chars: Vec<char> = full_text.chars().collect();
+        let mut frame = Self::default();
+        for i in 0..4 {
+            let char_idx = window + i;
+            if char_idx < chars.len() {
+                frame.digits[i] = char_to_segments(chars[char_idx]);
+            }
+        }
+        frame
+    }
+
+    /// Живые глазки: открыты (разряды 1 и 2)
+    pub fn open_eyes() -> Self {
+        let mut frame = Self::default();
+        let eye = DigitSegments { a: true, b: true, c: true, d: true, e: true, f: true, g: false };
+        frame.digits[1] = eye;
+        frame.digits[2] = eye;
+        frame
+    }
+
+    /// Живые глазки: моргание (горизонтальная полоска по центру)
+    pub fn blink_eyes() -> Self {
+        let mut frame = Self::default();
+        frame.digits[1].g = true;
+        frame.digits[2].g = true;
+        frame.minus = true;
+        frame
+    }
+
+    /// Живые глазки: взгляд влево
+    pub fn look_left() -> Self {
+        let mut frame = Self::default();
+        let left_eye = DigitSegments { a: true, b: false, c: false, d: true, e: true, f: true, g: false };
+        frame.digits[1] = left_eye;
+        frame.digits[2] = left_eye;
+        frame
+    }
+
+    /// Живые глазки: взгляд вправо
+    pub fn look_right() -> Self {
+        let mut frame = Self::default();
+        let right_eye = DigitSegments { a: true, b: true, c: true, d: true, e: false, f: false, g: false };
+        frame.digits[1] = right_eye;
+        frame.digits[2] = right_eye;
+        frame
+    }
+
+    /// Живые глазки: подмигивание (левый открыт, правый прищурен)
+    pub fn wink_eyes() -> Self {
+        let mut frame = Self::default();
+        frame.digits[1] = DigitSegments { a: true, b: true, c: true, d: true, e: true, f: true, g: false };
+        frame.digits[2].g = true;
+        frame
+    }
+
+    /// Живые глазки: довольные дуги ^^
+    pub fn happy_eyes() -> Self {
+        let mut frame = Self::default();
+        let arch = DigitSegments { a: true, b: true, c: false, d: false, e: false, f: true, g: true };
+        frame.digits[1] = arch;
+        frame.digits[2] = arch;
+        frame
+    }
+
+    /// Засыпающие глазки (стадии 0..3: открыты -> опущены -> щелочки -> глубокий сон)
+    pub fn sleepy_eyes(stage: usize) -> Self {
+        let mut frame = Self::default();
+        match stage {
+            0 => {
+                let eye = DigitSegments { a: true, b: true, c: true, d: true, e: true, f: true, g: false };
+                frame.digits[1] = eye;
+                frame.digits[2] = eye;
+            }
+            1 => {
+                // Сонные опущенные веки (нижний полубокс o o)
+                let lower_box = DigitSegments { a: false, b: false, c: true, d: true, e: true, f: false, g: true };
+                frame.digits[1] = lower_box;
+                frame.digits[2] = lower_box;
+            }
+            2 => {
+                // Полузакрытые щелочки (- - -)
+                frame.digits[1].g = true;
+                frame.digits[2].g = true;
+                frame.minus = true;
+            }
+            _ => {
+                // Полностью уснули (нижние ресницы _ _)
+                frame.digits[1].d = true;
+                frame.digits[2].d = true;
+            }
+        }
+        frame
+    }
     /// Значок паузы: две центрированные параллельные вертикальные полосы ||
     pub fn pause() -> Self {
         let mut frame = Self::default();
@@ -103,58 +245,153 @@ impl DisplayFrame {
         frame
     }
 
-    /// Кадр анимации переключения на следующий трек (Next >>)
-    pub fn next_track(step: usize) -> Self {
+    /// 1. Шторка / Сканер (Curtain Scanner: скольжение по 8 вертикальным позициям)
+    pub fn curtain_track(step: usize, is_next: bool) -> Self {
         let mut frame = Self::default();
-        match step {
+        let pos = if is_next { step } else { 7usize.saturating_sub(step) };
+        if pos < 8 {
+            let d = pos / 2;
+            let is_right = (pos % 2) == 1;
+            if is_right {
+                frame.digits[d].b = true;
+                frame.digits[d].c = true;
+            } else {
+                frame.digits[d].f = true;
+                frame.digits[d].e = true;
+            }
+            // Хвост затухания на предыдущем ребре
+            if is_next && pos > 0 {
+                let pd = (pos - 1) / 2;
+                if ((pos - 1) % 2) == 1 {
+                    frame.digits[pd].b = true;
+                    frame.digits[pd].c = true;
+                } else {
+                    frame.digits[pd].f = true;
+                    frame.digits[pd].e = true;
+                }
+            } else if !is_next && pos < 7 {
+                let nd = (pos + 1) / 2;
+                if ((pos + 1) % 2) == 1 {
+                    frame.digits[nd].b = true;
+                    frame.digits[nd].c = true;
+                } else {
+                    frame.digits[nd].f = true;
+                    frame.digits[nd].e = true;
+                }
+            }
+        }
+        frame
+    }
+
+    /// 2. Бобины / Катушки магнитофона (Tape Reels: вращение 1 и 4 + натянутая лента)
+    pub fn tape_track(step: usize, is_next: bool) -> Self {
+        let mut frame = Self::default();
+        // Лента по центру
+        frame.digits[1].d = true;
+        frame.digits[2].d = true;
+        frame.minus = true;
+
+        let phase = if is_next { step % 4 } else { (3 - (step % 4)) % 4 };
+        match phase {
             0 => {
-                frame.digits[0] = char_to_segments('>');
+                // Фаза 1: вертикаль A + D
+                frame.digits[0].a = true; frame.digits[0].d = true;
+                frame.digits[3].a = true; frame.digits[3].d = true;
             }
             1 => {
-                frame.digits[0] = char_to_segments('>');
-                frame.digits[1] = char_to_segments('>');
+                // Фаза 2: диагональ B + E
+                frame.digits[0].b = true; frame.digits[0].e = true;
+                frame.digits[3].b = true; frame.digits[3].e = true;
             }
             2 => {
-                frame.digits[1] = char_to_segments('>');
-                frame.digits[2] = char_to_segments('>');
+                // Фаза 3: диагональ C + F
+                frame.digits[0].c = true; frame.digits[0].f = true;
+                frame.digits[3].c = true; frame.digits[3].f = true;
             }
             3 => {
-                frame.digits[2] = char_to_segments('>');
-                frame.digits[3] = char_to_segments('>');
-            }
-            4 => {
-                frame.digits[3] = char_to_segments('>');
+                // Фаза 4: горизонталь G
+                frame.digits[0].g = true;
+                frame.digits[3].g = true;
             }
             _ => {}
         }
         frame
     }
 
-    /// Кадр анимации переключения на предыдущий трек (Prev <<)
-    pub fn prev_track(step: usize) -> Self {
+    /// 3. Каскадный барабан (Slot Machine Roll: вертикальный перекат D -> G -> A)
+    pub fn slot_track(step: usize, is_next: bool) -> Self {
         let mut frame = Self::default();
-        match step {
-            0 => {
-                frame.digits[3] = char_to_segments('<');
+        if is_next {
+            match step {
+                0 => { frame.digits[0].d = true; }
+                1 => { frame.digits[0].g = true; frame.digits[1].d = true; }
+                2 => { frame.digits[0].a = true; frame.digits[1].g = true; frame.digits[2].d = true; }
+                3 => { frame.digits[1].a = true; frame.digits[2].g = true; frame.digits[3].d = true; }
+                4 => { frame.digits[2].a = true; frame.digits[3].g = true; }
+                5 => { frame.digits[3].a = true; }
+                6 | 7 => {
+                    frame.digits[1] = char_to_segments('>');
+                    frame.digits[2] = char_to_segments('>');
+                }
+                _ => {}
             }
-            1 => {
-                frame.digits[3] = char_to_segments('<');
-                frame.digits[2] = char_to_segments('<');
+        } else {
+            match step {
+                0 => { frame.digits[3].a = true; }
+                1 => { frame.digits[3].g = true; frame.digits[2].a = true; }
+                2 => { frame.digits[3].d = true; frame.digits[2].g = true; frame.digits[1].a = true; }
+                3 => { frame.digits[2].d = true; frame.digits[1].g = true; frame.digits[0].a = true; }
+                4 => { frame.digits[1].d = true; frame.digits[0].g = true; }
+                5 => { frame.digits[0].d = true; }
+                6 | 7 => {
+                    frame.digits[1] = char_to_segments('<');
+                    frame.digits[2] = char_to_segments('<');
+                }
+                _ => {}
             }
-            2 => {
-                frame.digits[2] = char_to_segments('<');
-                frame.digits[1] = char_to_segments('<');
-            }
-            3 => {
-                frame.digits[1] = char_to_segments('<');
-                frame.digits[0] = char_to_segments('<');
-            }
-            4 => {
-                frame.digits[0] = char_to_segments('<');
-            }
-            _ => {}
         }
         frame
+    }
+
+    /// 4. Бегущий шеврон (Chevron Slide: стрелка ускоряется и переходит в >>)
+    pub fn chevron_track(step: usize, is_next: bool) -> Self {
+        let mut frame = Self::default();
+        let ch = if is_next { '>' } else { '<' };
+        if is_next {
+            match step {
+                0 => { frame.digits[0] = char_to_segments(ch); }
+                1 => { frame.digits[1] = char_to_segments(ch); }
+                2 => { frame.digits[2] = char_to_segments(ch); }
+                3 => { frame.digits[3] = char_to_segments(ch); }
+                4 | 5 => {
+                    frame.digits[1] = char_to_segments(ch);
+                    frame.digits[2] = char_to_segments(ch);
+                }
+                _ => {}
+            }
+        } else {
+            match step {
+                0 => { frame.digits[3] = char_to_segments(ch); }
+                1 => { frame.digits[2] = char_to_segments(ch); }
+                2 => { frame.digits[1] = char_to_segments(ch); }
+                3 => { frame.digits[0] = char_to_segments(ch); }
+                4 | 5 => {
+                    frame.digits[1] = char_to_segments(ch);
+                    frame.digits[2] = char_to_segments(ch);
+                }
+                _ => {}
+            }
+        }
+        frame
+    }
+
+    /// Базовая обратная совместимость
+    pub fn next_track(step: usize) -> Self {
+        Self::chevron_track(step, true)
+    }
+
+    pub fn prev_track(step: usize) -> Self {
+        Self::chevron_track(step, false)
     }
 
     /// Часы HH:MM
@@ -254,6 +491,24 @@ impl LedHardwareDriver {
                 let _ = std::fs::write(path, val_to_write);
                 self.last_state[i] = state;
             }
+        }
+    }
+
+    /// Принудительная безусловная перезапись всех 32 сегментов в sysfs (для сброса артефактов Алисы)
+    pub fn force_render(&mut self, frame: &DisplayFrame, brightness: u8) {
+        if !self.is_available {
+            return;
+        }
+
+        let current_bits = Self::frame_to_bits(frame);
+        let on_str = format!("{}\n", brightness);
+        let off_str = "0\n";
+
+        for (i, &state) in current_bits.iter().enumerate() {
+            let (_, path) = &self.segment_paths[i];
+            let val_to_write = if state { on_str.as_bytes() } else { off_str.as_bytes() };
+            let _ = std::fs::write(path, val_to_write);
+            self.last_state[i] = state;
         }
     }
 

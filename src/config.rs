@@ -66,6 +66,14 @@ pub struct StationConfig {
     /// Смещение часового пояса в часах для часов (по умолчанию +3 для Москвы)
     #[serde(default = "default_timezone_offset")]
     pub timezone_offset_hours: i32,
+
+    /// Стиль анимации переключения треков: "random", "curtain", "tape", "slot", "chevron"
+    #[serde(default = "default_track_animation_style")]
+    pub track_animation_style: String,
+}
+
+fn default_track_animation_style() -> String {
+    "random".to_string()
 }
 
 fn default_brightness() -> u8 {
@@ -134,6 +142,7 @@ impl Default for StationConfig {
             audio_routing: default_audio_routing(),
             display_brightness: default_brightness(),
             timezone_offset_hours: default_timezone_offset(),
+            track_animation_style: default_track_animation_style(),
         }
     }
 }
