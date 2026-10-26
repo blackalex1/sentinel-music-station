@@ -1,0 +1,27 @@
+[package]
+name = "sentinel-station"
+version = "0.1.0"
+edition = "2021"
+description = "Нативный легковесный клиент Sentinel Music для умных колонок (Яндекс Станция) на базе ALSA и Rust"
+authors = ["Sentinel Music Team"]
+
+[dependencies]
+tokio = { version = "1.38", features = ["full"] }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+url = "2.5"
+rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }
+symphonia = { version = "0.5", features = ["mp3", "flac", "wav", "aac", "isomp4"] }
+rustfft = "6.2"
+ratatui = "0.28"
+crossterm = "0.28"
+bytes = "1"
+libc = "0.2"

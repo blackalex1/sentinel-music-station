@@ -1,0 +1,15 @@
+[Unit]
+Description=Sentinel Station — Нативный аудиоплеер для умных колонок
+After=network.target sound.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/opt/sentinel-station
+ExecStart=/data/opt/sentinel-station/bin/sentinel-station start --config /data/opt/sentinel-station/config.toml
+Restart=always
+RestartSec=5
+StandardOutput=append:/data/opt/sentinel-station/logs/station.log
+StandardError=append:/data/opt/sentinel-station/logs/station.log
+
+[Install]
+WantedBy=multi-user.target

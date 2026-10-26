@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target
+
+# Local production configuration and tokens
+config.toml
+dist/
+
+# Firmware dumps and reverse-engineering configs
+*.cfg
+docs/*.cfg
+
+# Logs and secrets
+*.log
+*.token
+*.key
+*.pem
+
+# Editor and OS junk
+.idea/
+.vscode/
+*.swp
+*.bak
+.DS_Store
+Thumbs.db

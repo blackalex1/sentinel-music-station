@@ -1,0 +1,144 @@
+name: Build & Release Sentinel Station
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Создать официальный релиз на GitHub (true/false)'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: armv7-unknown-linux-gnueabihf
+            arch_name: armv7
+            desc: "Яндекс.Станция (Мини 1/2, Лайт, Станция 2), Raspberry Pi 32-bit"
+            gcc_pkg: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross libasound2-dev:armhf
+            foreign_arch: armhf
+            pkg_config_path: /usr/lib/arm-linux-gnueabihf/pkgconfig
+            linker: arm-linux-gnueabihf-gcc
+
+          - target: aarch64-unknown-linux-gnu
+            arch_name: aarch64
+            desc: "64-битные ARM устройства (Raspberry Pi 4/5, Orange Pi, Linux SBC)"
+            gcc_pkg: gcc-aarch64-linux-gnu libc6-dev-arm64-cross libasound2-dev:arm64
+            foreign_arch: arm64
+            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
+            linker: aarch64-linux-gnu-gcc
+
+          - target: x86_64-unknown-linux-gnu
+            arch_name: x86_64
+            desc: "Linux x86_64 (ПК, сервер, ноутбук)"
+            gcc_pkg: libasound2-dev
+            foreign_arch: ""
+            pkg_config_path: /usr/lib/x86_64-linux-gnu/pkgconfig
+            linker: gcc
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies & Toolchain (${{ matrix.target }})
+        run: |
+          if [ -n "${{ matrix.foreign_arch }}" ]; then
+            sudo dpkg --add-architecture ${{ matrix.foreign_arch }}
+          fi
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ${{ matrix.gcc_pkg }} \
+            pkg-config
+
+      - name: Setup Rust Stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo Dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build Binary (${{ matrix.target }})
+        env:
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG_PATH: ${{ matrix.pkg_config_path }}
+        run: |
+          TARGET_ENV=$(echo "${{ matrix.target }}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+          export CARGO_TARGET_${TARGET_ENV}_LINKER="${{ matrix.linker }}"
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Release Archive (${{ matrix.target }})
+        run: |
+          PKG_DIR="sentinel-station-${{ matrix.target }}"
+          mkdir -p "$PKG_DIR/bin" "$PKG_DIR/scripts"
+
+          cp "target/${{ matrix.target }}/release/sentinel-station" "$PKG_DIR/bin/"
+          chmod +x "$PKG_DIR/bin/sentinel-station"
+
+          cp config.example.toml "$PKG_DIR/"
+          cp scripts/install.sh "$PKG_DIR/"
+          chmod +x "$PKG_DIR/install.sh"
+
+          cp scripts/S99sentinel-station "$PKG_DIR/scripts/"
+          cp scripts/sentinel-station.service "$PKG_DIR/scripts/"
+          cp README.md "$PKG_DIR/"
+
+          tar -czvf "${PKG_DIR}.tar.gz" "$PKG_DIR"
+          sha256sum "${PKG_DIR}.tar.gz" > "${PKG_DIR}.tar.gz.sha256"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-station-${{ matrix.target }}
+          path: |
+            sentinel-station-${{ matrix.target }}.tar.gz
+            sentinel-station-${{ matrix.target }}.tar.gz.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate Checksums
+        working-directory: release-artifacts
+        run: |
+          ls -lah
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/*.tar.gz
+            release-artifacts/*.sha256
+            release-artifacts/SHA256SUMS.txt
+          draft: false
+          prerelease: false
+          generate_release_notes: true
