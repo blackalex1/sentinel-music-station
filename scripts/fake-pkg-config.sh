@@ -11,5 +11,6 @@ if [ "$1" = "--atleast-pkgconfig-version" ] || [ "$1" = "--atleast-version" ]; t
     exit 0
 fi
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-echo "-L$DIR/../libs/armv7 -lasound"
+ARCH="${SENTINEL_ARCH:-armv7}"
+echo "-L$DIR/../libs/$ARCH -lasound"
 exit 0

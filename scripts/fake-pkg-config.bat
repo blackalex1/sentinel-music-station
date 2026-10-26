@@ -13,7 +13,8 @@ if "%1"=="--atleast-pkgconfig-version" (
 if "%1"=="--atleast-version" (
     exit /b 0
 )
-set "LIBDIR=%~dp0..\libs\armv7"
+if "%SENTINEL_ARCH%"=="" set "SENTINEL_ARCH=armv7"
+set "LIBDIR=%~dp0..\libs\%SENTINEL_ARCH%"
 set "LIBDIR=%LIBDIR:\=/%"
 echo -L%LIBDIR% -lasound
 exit /b 0
