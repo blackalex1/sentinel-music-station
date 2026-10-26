@@ -58,17 +58,8 @@ jobs:
         run: |
           if [ -n "${{ matrix.foreign_arch }}" ]; then
             sudo dpkg --add-architecture ${{ matrix.foreign_arch }}
-            # Ограничиваем базовые репозитории только amd64 и i386, чтобы apt не искал armhf на archive.ubuntu.com
             sudo sed -i 's/^Types: deb/Types: deb\nArchitectures: amd64 i386/' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
-            # Подключаем зеркало портов Ubuntu для ARM-архитектур
-            sudo tee /etc/apt/sources.list.d/ports.sources <<EOF
-Types: deb
-URIs: http://ports.ubuntu.com/ubuntu-ports/
-Suites: noble noble-updates noble-security
-Components: main universe
-Architectures: ${{ matrix.foreign_arch }}
-Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-EOF
+            printf "Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble noble-updates noble-security\nComponents: main universe\nArchitectures: %s\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n" "${{ matrix.foreign_arch }}" | sudo tee /etc/apt/sources.list.d/ports.sources
           fi
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
