@@ -99,7 +99,8 @@ impl VoiceInterceptor {
             }
         };
 
-        let mut in_call_or_alarm = false;
+        let mut in_call = false;
+        let mut in_alarm_or_timer = false;
 
         // Проверяем последние 8 КБ лога, чтобы узнать, не идет ли уже звонок или будильник в момент запуска
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -109,14 +110,19 @@ impl VoiceInterceptor {
         let mut init_line = String::new();
         while init_reader.read_line(&mut init_line).unwrap_or(0) > 0 {
             let lower = init_line.to_lowercase();
-            if Self::is_call_or_alarm_start(&lower) {
-                in_call_or_alarm = true;
-            } else if Self::is_call_or_alarm_end(&lower) {
-                in_call_or_alarm = false;
+            if Self::is_call_start(&lower) {
+                in_call = true;
+            } else if Self::is_call_end(&lower) {
+                in_call = false;
+            }
+            if Self::is_alarm_or_timer_start(&lower) {
+                in_alarm_or_timer = true;
+            } else if Self::is_alarm_or_timer_end(&lower) {
+                in_alarm_or_timer = false;
             }
             init_line.clear();
         }
-        if in_call_or_alarm {
+        if in_call || in_alarm_or_timer {
             info!("📞 При запуске обнаружен активный звонок или будильник/таймер — освобождаем кнопки для Алисы");
             let _ = self.is_active_tx.send(false);
             let display_tx = self.display_tx.clone();
@@ -158,37 +164,57 @@ impl VoiceInterceptor {
                     }
 
                     let lower = line.to_lowercase();
+                    let prev_busy = in_call || in_alarm_or_timer;
 
-                    // 1. Автоматический перехват событий входящих/исходящих звонков и будильников/таймеров
-                    if Self::is_call_or_alarm_start(&lower) {
-                        if !in_call_or_alarm {
-                            in_call_or_alarm = true;
-                            info!("📞 Обнаружен звонок, будильник или таймер на Станции! (лог: {})", line);
-                            info!("🔓 Освобождаем кнопки для ответа/остановки и приостанавливаем Sentinel Music");
-                            let _ = self.is_active_tx.send(false);
-                            let player_tx = self.player_tx.clone();
-                            let display_tx = self.display_tx.clone();
-                            tokio::spawn(async move {
-                                let _ = display_tx.send(DisplayCommand::PassThrough).await;
-                                let _ = player_tx.send(PlayerCommand::Pause).await;
-                            });
+                    // 1. Отслеживание состояния телефонных звонков (PJSIP / WebRTC)
+                    if Self::is_call_start(&lower) {
+                        if !in_call {
+                            in_call = true;
+                            info!("📞 Обнаружен входящий или исходящий звонок на Станции! (лог: {})", line);
                         }
-                    } else if Self::is_call_or_alarm_end(&lower) {
-                        if in_call_or_alarm {
-                            in_call_or_alarm = false;
-                            info!("📴 Вызов, будильник или таймер на Станции завершен (лог: {})", line);
-                            info!("🔒 Возвращаем сенсорные кнопки под управление Sentinel Station");
-                            let _ = self.is_active_tx.send(true);
-                            let display_tx = self.display_tx.clone();
-                            tokio::spawn(async move {
-                                let _ = display_tx.send(DisplayCommand::PassThroughResume).await;
-                            });
+                    } else if Self::is_call_end(&lower) {
+                        if in_call {
+                            in_call = false;
+                            info!("📴 Телефонный вызов на Станции завершен (лог: {})", line);
                         }
                     }
 
-                    // 2. Распознавание голосовых команд Алисы (во время звонка или будильника не перехватываем)
+                    // 2. Отслеживание срабатывания будильников и таймеров
+                    if Self::is_alarm_or_timer_start(&lower) {
+                        if !in_alarm_or_timer {
+                            in_alarm_or_timer = true;
+                            info!("⏰ Сработал будильник или таймер на Станции! (лог: {})", line);
+                        }
+                    } else if Self::is_alarm_or_timer_end(&lower) {
+                        if in_alarm_or_timer {
+                            in_alarm_or_timer = false;
+                            info!("🔔 Будильник или таймер на Станции остановлен (лог: {})", line);
+                        }
+                    }
+
+                    let curr_busy = in_call || in_alarm_or_timer;
+
+                    if !prev_busy && curr_busy {
+                        info!("🔓 Освобождаем кнопки для Алисы (звонок/будильник/таймер) и приостанавливаем Sentinel Music");
+                        let _ = self.is_active_tx.send(false);
+                        let player_tx = self.player_tx.clone();
+                        let display_tx = self.display_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = display_tx.send(DisplayCommand::PassThrough).await;
+                            let _ = player_tx.send(PlayerCommand::Pause).await;
+                        });
+                    } else if prev_busy && !curr_busy {
+                        info!("🔒 Возвращаем сенсорные кнопки под управление Sentinel Station");
+                        let _ = self.is_active_tx.send(true);
+                        let display_tx = self.display_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = display_tx.send(DisplayCommand::PassThroughResume).await;
+                        });
+                    }
+
+                    // 3. Распознавание голосовых команд Алисы (во время звонка или будильника не перехватываем)
                     if line.contains("recognizedPhrase='") {
-                        if in_call_or_alarm {
+                        if curr_busy {
                             continue;
                         }
                         if let Some(phrase) = Self::extract_recognized_phrase(line) {
@@ -212,13 +238,12 @@ impl VoiceInterceptor {
         }
     }
 
-    /// Проверка, указывает ли строка лога на входящий/исходящий звонок или срабатывание будильника / таймера
-    fn is_call_or_alarm_start(lower: &str) -> bool {
-        if Self::is_call_or_alarm_end(lower) {
+    /// Проверка, указывает ли строка лога на входящий/исходящий звонок
+    fn is_call_start(lower: &str) -> bool {
+        if Self::is_call_end(lower) {
             return false;
         }
 
-        // 1. События звонков (PJSIP / WebRTC / PhoneCallsCapability)
         lower.contains("incoming call")
             || lower.contains("onincomingcall")
             || lower.contains("new incoming call")
@@ -230,21 +255,14 @@ impl VoiceInterceptor {
             || lower.contains("call state changed: early")
             || lower.contains("outgoing call connected")
             || lower.contains("call_incoming.led")
+            || lower.contains("call_outgoing.led")
+            || lower.contains("call_connecting.led")
             || lower.contains("calls_ringing_incoming")
-            // 2. События будильников и таймеров
-            || lower.contains("timer.led")
-            || lower.contains("ringing.binscled")
-            || lower.contains("ringing.scled")
-            || lower.contains("alarmfiredevent")
-            || lower.contains("alarm event fired")
-            || lower.contains("ontimerfired")
-            || lower.contains("processexpiredevent")
-            || (lower.contains("local_audio_file_play") && lower.contains("audiofileplayercapability"))
+            || lower.contains("calls_ringing_outgoing")
     }
 
-    /// Проверка, указывает ли строка лога на окончание звонка или остановку будильника / таймера
-    fn is_call_or_alarm_end(lower: &str) -> bool {
-        // 1. Завершение звонка
+    /// Проверка, указывает ли строка лога на окончание телефонного звонка
+    fn is_call_end(lower: &str) -> bool {
         lower.contains("call ended")
             || lower.contains("current call ended")
             || lower.contains("incoming call ended")
@@ -257,8 +275,26 @@ impl VoiceInterceptor {
             || lower.contains("reject_incoming_call")
             || lower.contains("call_ended.led")
             || lower.contains("calls_ended")
-            // 2. Остановка будильника или таймера
-            || lower.contains("timer_stop_directive")
+    }
+
+    /// Проверка, указывает ли строка лога на срабатывание будильника / таймера
+    fn is_alarm_or_timer_start(lower: &str) -> bool {
+        if Self::is_alarm_or_timer_end(lower) {
+            return false;
+        }
+
+        lower.contains("timer.led")
+            || lower.contains("ringing.binscled")
+            || lower.contains("ringing.scled")
+            || lower.contains("alarmfiredevent")
+            || lower.contains("alarm event fired")
+            || lower.contains("ontimerfired")
+            || lower.contains("processexpiredevent")
+    }
+
+    /// Проверка, указывает ли строка лога на остановку будильника / таймера
+    fn is_alarm_or_timer_end(lower: &str) -> bool {
+        lower.contains("timer_stop_directive")
             || lower.contains("alarm_stop_directive")
             || lower.contains("local_audio_file_stop")
             || lower.contains("alarm was already stopped")
