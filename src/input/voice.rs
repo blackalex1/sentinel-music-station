@@ -8,6 +8,28 @@ use tracing::{debug, info, warn};
 use crate::connect::protocol::{PlayerCommand, PlayerState};
 use crate::visualizer::DisplayCommand;
 
+#[cfg(unix)]
+fn get_file_ino(file: &File) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().ok().map(|m| m.ino())
+}
+
+#[cfg(not(unix))]
+fn get_file_ino(_file: &File) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn get_path_ino(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.ino())
+}
+
+#[cfg(not(unix))]
+fn get_path_ino(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
 /// Локальный перехватчик голосовых команд Алисы через журнал событий Quasar (maind)
 pub struct VoiceInterceptor {
     player_tx: mpsc::Sender<PlayerCommand>,
@@ -101,6 +123,7 @@ impl VoiceInterceptor {
 
         let mut in_call = false;
         let mut in_alarm_or_timer = false;
+        let mut alarm_start_time: Option<Instant> = None;
 
         // Проверяем последние 8 КБ лога, чтобы узнать, не идет ли уже звонок или будильник в момент запуска
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -117,8 +140,10 @@ impl VoiceInterceptor {
             }
             if Self::is_alarm_or_timer_start(&lower) {
                 in_alarm_or_timer = true;
+                alarm_start_time = Some(Instant::now());
             } else if Self::is_alarm_or_timer_end(&lower) {
                 in_alarm_or_timer = false;
+                alarm_start_time = None;
             }
             init_line.clear();
         }
@@ -144,15 +169,34 @@ impl VoiceInterceptor {
             line_buffer.clear();
             match reader.read_line(&mut line_buffer) {
                 Ok(0) => {
-                    // Конец файла (EOF): проверяем ротацию файла (если размер уменьшился)
-                    if let Ok(meta) = fs::metadata(&self.log_path) {
-                        if let Ok(pos) = reader.stream_position() {
-                            if meta.len() < pos {
-                                // Файл ротировался, переоткрываем
-                                if let Ok(new_file) = File::open(&self.log_path) {
-                                    reader = BufReader::new(new_file);
+                    // Конец файла (EOF): проверяем ротацию файла по смене inode или уменьшению размера
+                    let should_reopen = match fs::metadata(&self.log_path) {
+                        Ok(meta) => {
+                            let path_ino = get_path_ino(&self.log_path);
+                            let curr_ino = get_file_ino(reader.get_ref());
+                            let ino_changed = match (path_ino, curr_ino) {
+                                (Some(p), Some(c)) => p != c,
+                                _ => false,
+                            };
+                            let size_dropped = match reader.stream_position() {
+                                Ok(pos) => meta.len() < pos,
+                                Err(_) => false,
+                            };
+                            ino_changed || size_dropped
+                        }
+                        Err(_) => false,
+                    };
+
+                    if should_reopen {
+                        if let Ok(mut new_file) = File::open(&self.log_path) {
+                            // Если новый файл уже накопил много строк (ротация была давно),
+                            // прыгаем к хвосту, чтобы не воспроизводить старые команды
+                            if let Ok(meta) = new_file.metadata() {
+                                if meta.len() > 16384 {
+                                    let _ = new_file.seek(SeekFrom::End(0));
                                 }
                             }
+                            reader = BufReader::new(new_file);
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -183,12 +227,25 @@ impl VoiceInterceptor {
                     if Self::is_alarm_or_timer_start(&lower) {
                         if !in_alarm_or_timer {
                             in_alarm_or_timer = true;
+                            alarm_start_time = Some(Instant::now());
                             info!("⏰ Сработал будильник или таймер на Станции! (лог: {})", line);
                         }
                     } else if Self::is_alarm_or_timer_end(&lower) {
                         if in_alarm_or_timer {
                             in_alarm_or_timer = false;
+                            alarm_start_time = None;
                             info!("🔔 Будильник или таймер на Станции остановлен (лог: {})", line);
+                        }
+                    }
+
+                    // Авто-сброс будильника/таймера по таймауту (180 сек), если событие остановки не попало в лог
+                    if in_alarm_or_timer {
+                        if let Some(start_t) = alarm_start_time {
+                            if start_t.elapsed() > Duration::from_secs(180) {
+                                in_alarm_or_timer = false;
+                                alarm_start_time = None;
+                                info!("⏰ Таймаут активности будильника (3 мин) истек — сбрасываем флаг занятости");
+                            }
                         }
                     }
 
@@ -212,11 +269,8 @@ impl VoiceInterceptor {
                         });
                     }
 
-                    // 3. Распознавание голосовых команд Алисы (во время звонка или будильника не перехватываем)
+                    // 3. Распознавание голосовых команд Алисы
                     if line.contains("recognizedPhrase='") {
-                        if curr_busy {
-                            continue;
-                        }
                         if let Some(phrase) = Self::extract_recognized_phrase(line) {
                             let now = Instant::now();
                             // Защита от дублирования одной и той же фразы в пределах 1 секунды
@@ -226,7 +280,20 @@ impl VoiceInterceptor {
                             last_phrase = phrase.clone();
                             last_phrase_time = now;
 
-                            self.handle_voice_phrase(&phrase);
+                            // Явные команды активации Sentinel или запуска Потока обрабатываются ВСЕГДА,
+                            // даже если флаг звонка или будильника остался активным из-за бага
+                            let is_wake = Self::is_activation_phrase(&phrase) || Self::is_flow_phrase(&phrase);
+                            if is_wake {
+                                if curr_busy {
+                                    info!("⚡ Явная команда активации/Потока '{}' сбрасывает флаг занятости", phrase);
+                                    in_call = false;
+                                    in_alarm_or_timer = false;
+                                    alarm_start_time = None;
+                                }
+                                self.handle_voice_phrase(&phrase);
+                            } else if !curr_busy {
+                                self.handle_voice_phrase(&phrase);
+                            }
                         }
                     }
                 }
@@ -277,14 +344,102 @@ impl VoiceInterceptor {
             || lower.contains("calls_ended")
     }
 
+    /// Проверка, указывает ли фраза на деактивацию Sentinel
+    pub fn is_deactivation_phrase(phrase: &str) -> bool {
+        let p = phrase.trim();
+        p == "выключи сентинел"
+            || p == "отключи сентинел"
+            || p == "деактивируй сентинел"
+            || p == "усыпи сентинел"
+            || p == "стоп сентинел"
+            || p == "режим алисы"
+            || p == "переключи на алису"
+            || p == "верни алису"
+            || p == "вернуть алису"
+            || p == "выключи сентинель"
+            || p == "отключи сентинель"
+            || p == "режим яндекс"
+            || p == "верни яндекс"
+            || p == "выключи sentinel"
+            || p == "отключи sentinel"
+            || p == "деактивируй sentinel"
+            || p == "стоп sentinel"
+            || p.starts_with("выключи сентинел")
+            || p.starts_with("отключи сентинел")
+            || p.starts_with("верни алису")
+            || p.starts_with("вернуть алису")
+    }
+
+    /// Проверка, указывает ли фраза на активацию Sentinel
+    pub fn is_activation_phrase(phrase: &str) -> bool {
+        let p = phrase.trim();
+        p == "сентинел"
+            || p == "сентинель"
+            || p == "сантинел"
+            || p == "сантинель"
+            || p == "sentinel"
+            || p == "включи сентинел"
+            || p == "включить сентинел"
+            || p == "запусти сентинел"
+            || p == "активируй сентинел"
+            || p == "разбуди сентинел"
+            || p == "режим сентинел"
+            || p == "переключи на сентинел"
+            || p == "верни сентинел"
+            || p == "вернуть сентинел"
+            || p == "открой сентинел"
+            || p == "включи сентинель"
+            || p == "запусти сентинель"
+            || p == "активируй сентинель"
+            || p == "разбуди сентинель"
+            || p == "режим сентинель"
+            || p == "переключи на сентинель"
+            || p == "верни сентинель"
+            || p == "открой сентинель"
+            || p == "включи sentinel"
+            || p == "запусти sentinel"
+            || p == "активируй sentinel"
+            || p == "разбуди sentinel"
+            || p == "режим sentinel"
+            || p == "переключи на sentinel"
+            || p == "верни sentinel"
+            || p.starts_with("включи сентинел")
+            || p.starts_with("включить сентинел")
+            || p.starts_with("запусти сентинел")
+            || p.starts_with("активируй сентинел")
+            || p.starts_with("разбуди сентинел")
+            || p.starts_with("верни сентинел")
+            || p.starts_with("вернуть сентинел")
+            || p.starts_with("открой сентинел")
+            || p.starts_with("включи сентинель")
+            || p.starts_with("запусти сентинель")
+            || p.starts_with("верни сентинель")
+            || p.starts_with("включи sentinel")
+            || p.starts_with("запусти sentinel")
+            || p.starts_with("верни sentinel")
+    }
+
+    /// Проверка, указывает ли фраза на запуск бесконечного Потока
+    pub fn is_flow_phrase(phrase: &str) -> bool {
+        let p = phrase.trim();
+        p == "поток"
+            || p == "мой поток"
+            || p == "музыкальный поток"
+            || p == "поток музыки"
+            || p.starts_with("включи поток")
+            || p.starts_with("запусти поток")
+            || p.starts_with("мой поток")
+            || p.starts_with("включи мой поток")
+            || p.starts_with("запусти мой поток")
+    }
+
     /// Проверка, указывает ли строка лога на срабатывание будильника / таймера
     fn is_alarm_or_timer_start(lower: &str) -> bool {
         if Self::is_alarm_or_timer_end(lower) {
             return false;
         }
 
-        lower.contains("timer.led")
-            || lower.contains("ringing.binscled")
+        lower.contains("ringing.binscled")
             || lower.contains("ringing.scled")
             || lower.contains("alarmfiredevent")
             || lower.contains("alarm event fired")
@@ -332,21 +487,7 @@ impl VoiceInterceptor {
         info!("🗣️ Распознана голосовая фраза Алисы: '{}'", phrase);
 
         // 0. Деактивация / переход Sentinel в режим ожидания (Passthrough)
-        if phrase == "выключи сентинел"
-            || phrase == "отключи сентинел"
-            || phrase == "деактивируй сентинел"
-            || phrase == "усыпи сентинел"
-            || phrase == "стоп сентинел"
-            || phrase == "режим алисы"
-            || phrase == "переключи на алису"
-            || phrase == "верни алису"
-            || phrase == "выключи sentinel"
-            || phrase == "отключи sentinel"
-            || phrase == "деактивируй sentinel"
-            || phrase == "стоп sentinel"
-            || phrase == "режим яндекс"
-            || phrase == "верни яндекс"
-        {
+        if Self::is_deactivation_phrase(phrase) {
             info!("💤 Голосовая команда: ДЕАКТИВАЦИЯ Sentinel Station (переход в режим ожидания/Алисы)");
             Self::stop_alice_playback();
             let _ = self.is_active_tx.send(false);
@@ -361,23 +502,7 @@ impl VoiceInterceptor {
         }
 
         // 0.1. Активация / пробуждение Sentinel Station
-        if phrase == "включи сентинел"
-            || phrase == "запусти сентинел"
-            || phrase == "активируй сентинел"
-            || phrase == "разбуди сентинел"
-            || phrase == "режим сентинел"
-            || phrase == "переключи на сентинел"
-            || phrase == "верни сентинел"
-            || phrase == "сентинел"
-            || phrase == "включи sentinel"
-            || phrase == "запусти sentinel"
-            || phrase == "активируй sentinel"
-            || phrase == "разбуди sentinel"
-            || phrase == "режим sentinel"
-            || phrase == "переключи на sentinel"
-            || phrase == "верни sentinel"
-            || phrase == "sentinel"
-        {
+        if Self::is_activation_phrase(phrase) {
             info!("⚡ Голосовая команда: АКТИВАЦИЯ Sentinel Station (возврат управления плеером)");
             let _ = self.is_active_tx.send(true);
             Self::stop_alice_playback();
@@ -390,17 +515,7 @@ impl VoiceInterceptor {
         }
 
         // 0.2. Запуск умного бесконечного Потока (Flow)
-        let is_flow_cmd = phrase == "поток"
-            || phrase == "мой поток"
-            || phrase == "музыкальный поток"
-            || phrase == "поток музыки"
-            || phrase.starts_with("включи поток")
-            || phrase.starts_with("запусти поток")
-            || phrase.starts_with("мой поток")
-            || phrase.starts_with("включи мой поток")
-            || phrase.starts_with("запусти мой поток");
-
-        if is_flow_cmd {
+        if Self::is_flow_phrase(phrase) {
             let was_active = *self.is_active_tx.borrow();
             if !was_active {
                 info!("⚡ Голосовая команда запуска Потока пробуждает Sentinel Station!");
