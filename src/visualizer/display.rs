@@ -172,10 +172,12 @@ impl DisplayManager {
                     DisplayCommand::Standby => {
                         clock_driver.invalidate();
                         transition_seq = Some(TransitionSequence::Deactivation(Instant::now()));
+                        Self::play_feedback_sound("/data/opt/sentinel-station/sounds/alice_return.wav");
                     }
                     DisplayCommand::Active => {
                         clock_driver.invalidate();
                         transition_seq = Some(TransitionSequence::Activation(Instant::now()));
+                        Self::play_feedback_sound("/data/opt/sentinel-station/sounds/sentinel_online.wav");
                     }
                     DisplayCommand::Flow => {
                         clock_driver.invalidate();
@@ -284,18 +286,6 @@ impl DisplayManager {
                         } else {
                             transition_seq = None;
                             clock_driver.invalidate();
-
-                            let sound_path = "/data/opt/sentinel-station/sounds/sentinel_online.wav";
-                            if std::path::Path::new(sound_path).exists() {
-                                tokio::spawn(async move {
-                                    let _ = tokio::process::Command::new("aplay")
-                                        .arg("-D")
-                                        .arg("default")
-                                        .arg(sound_path)
-                                        .status()
-                                        .await;
-                                });
-                            }
                         }
                     }
                     TransitionSequence::Deactivation(start) => {
@@ -320,18 +310,6 @@ impl DisplayManager {
                             // Сразу выводим текущие часы HH:MM, чтобы экран не оставался темным до смены минуты Алисы
                             let clock_frame = Self::render_clock_frame(self.timezone_offset_hours);
                             clock_driver.force_render(&clock_frame, 170);
-
-                            let sound_path = "/data/opt/sentinel-station/sounds/alice_return.wav";
-                            if std::path::Path::new(sound_path).exists() {
-                                tokio::spawn(async move {
-                                    let _ = tokio::process::Command::new("aplay")
-                                        .arg("-D")
-                                        .arg("default")
-                                        .arg(sound_path)
-                                        .status()
-                                        .await;
-                                });
-                            }
                         }
                     }
                     TransitionSequence::Flow(start) => {
@@ -633,5 +611,19 @@ impl DisplayManager {
         let minutes = (total_mins % 60) as u32;
         let colon = (total_secs % 2) == 0;
         DisplayFrame::clock(hours, minutes, colon)
+    }
+
+    /// Асинхронное воспроизведение звукового файла обратной связи через aplay в параллель с анимацией
+    fn play_feedback_sound(sound_path: &'static str) {
+        if std::path::Path::new(sound_path).exists() {
+            tokio::spawn(async move {
+                let _ = tokio::process::Command::new("aplay")
+                    .arg("-D")
+                    .arg("default")
+                    .arg(sound_path)
+                    .status()
+                    .await;
+            });
+        }
     }
 }
