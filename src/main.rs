@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rodio::{OutputStream, OutputStreamHandle};
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod audio;
@@ -73,6 +73,12 @@ fn cleanup_stale_alsa_ipc() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 0. Проверка аварийного kill-switch: если файл существует, сервис безопасно выходит без ошибок
+    if std::path::Path::new("/data/opt/sentinel-station/disabled").exists() {
+        println!("🛑 Sentinel Station деактивирован через kill-switch (/data/opt/sentinel-station/disabled)");
+        return Ok(());
+    }
+
     let cli = Cli::parse();
     let is_tui = matches!(cli.command, Some(Commands::Tui));
 
@@ -209,8 +215,26 @@ async fn main() -> Result<()> {
         }
         Commands::Start => {
             cleanup_stale_alsa_ipc();
-            let (_stream, stream_handle) = OutputStream::try_default()
-                .context("Не удалось открыть звуковое устройство ALSA/Audio")?;
+            let mut attempts = 0;
+            let (_stream, stream_handle) = loop {
+                match OutputStream::try_default() {
+                    Ok(res) => break res,
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts == 1 {
+                            warn!("ALSA аудиоустройство временно занято (возможно, играет Алиса: {}). Запрос на сброс воспроизведения...", e);
+                            VoiceInterceptor::stop_alice_playback();
+                        }
+                        if attempts >= 10 {
+                            warn!("ALSA по-прежнему занято после 10 попыток. Защитное ожидание 3 сек...");
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            attempts = 0;
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+            };
             run_daemon(config, stream_handle).await
         }
         Commands::Tui => {

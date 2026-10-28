@@ -1,13 +1,100 @@
 #!/bin/sh
+# ==============================================================================
+# Sentinel Station Init & Supervisor Script with Circuit Breaker (Fail-Safe)
+# ==============================================================================
 DIR=/data/opt/sentinel-station
 BIN=$DIR/bin/sentinel-station
 CONF=$DIR/config.toml
 LOG=$DIR/logs/station.log
+DISABLED=$DIR/disabled
+CRASH_LOG=/tmp/sentinel-station.crashes
+SUPERVISOR_PIDFILE=/var/run/sentinel-supervisor.pid
+
+cleanup_ipc() {
+  for s in $(ipcs -s 2>/dev/null | awk '$1=="0x00000400"{print $2}'); do ipcrm -s "$s" 2>/dev/null; done
+  for m in $(ipcs -m 2>/dev/null | awk '$1=="0x00000400"||$1=="0x00000401"{print $2}'); do ipcrm -m "$m" 2>/dev/null; done
+}
+
+supervisor_loop() {
+  mkdir -p "$DIR/logs"
+  echo "[supervisor] Запуск защищенного супервайзера Sentinel Station (PID $$)" >> "$LOG"
+
+  while true; do
+    # 1. Проверка защитного флага отключения (kill-switch)
+    if [ -f "$DISABLED" ]; then
+      echo "[supervisor] Обнаружен файл $DISABLED. Сервис деактивирован." >> "$LOG"
+      rm -f "$SUPERVISOR_PIDFILE"
+      exit 0
+    fi
+
+    # 2. Предохранитель от частых падений (Circuit Breaker):
+    # Не более 4 падений за последние 60 секунд
+    NOW=$(date +%s)
+    echo "$NOW" >> "$CRASH_LOG"
+    
+    CUTOFF=$((NOW - 60))
+    RECENT_CRASHES=0
+    if [ -f "$CRASH_LOG" ]; then
+      TMP_CRASHES="/tmp/crashes.$$"
+      awk -v cutoff="$CUTOFF" '$1 > cutoff { print $1 }' "$CRASH_LOG" > "$TMP_CRASHES" 2>/dev/null
+      mv -f "$TMP_CRASHES" "$CRASH_LOG"
+      RECENT_CRASHES=$(wc -l < "$CRASH_LOG" 2>/dev/null || echo 0)
+    fi
+
+    if [ "$RECENT_CRASHES" -ge 4 ]; then
+      echo "[CIRCUIT BREAKER] ⚠️ Зафиксировано $RECENT_CRASHES аварий подряд за 60 секунд!" >> "$LOG"
+      echo "[CIRCUIT BREAKER] Переход в защитный режим ожидания на 15 минут для гарантированной стабильности Алисы." >> "$LOG"
+      sleep 900
+      rm -f "$CRASH_LOG"
+      continue
+    fi
+
+    cleanup_ipc
+
+    # 3. Запуск демона с пониженным приоритетом CPU (nice 10)
+    # Гарантирует, что штатная Алиса и аппаратный watchdog никогда не будут заблокированы
+    nice -n 10 "$BIN" --config "$CONF" start >> "$LOG" 2>&1
+    EXIT_CODE=$?
+
+    # Если сервис остановлен штатно (код 0), очищаем историю аварий
+    if [ "$EXIT_CODE" -eq 0 ]; then
+      rm -f "$CRASH_LOG"
+    fi
+
+    # Защитная пауза 2 сек перед повторным запуском
+    sleep 2
+  done
+}
 
 start() {
-  [ -x "$BIN" ] || return 1
-  pidof sentinel-station >/dev/null 2>&1 && return 0
-  "$BIN" --config "$CONF" start </dev/null >>"$LOG" 2>&1 &
+  [ -x "$BIN" ] || { echo "Binary $BIN not found or not executable"; return 1; }
+  
+  if [ -f "$DISABLED" ]; then
+    echo "Sentinel Station отключен флагом $DISABLED. Для включения удалите этот файл."
+    return 0
+  fi
+
+  if pidof sentinel-station >/dev/null 2>&1; then
+    echo "Sentinel Station уже запущен (PID: $(pidof sentinel-station))"
+    return 0
+  fi
+
+  # Запуск супервайзера в фоновом режиме
+  supervisor_loop </dev/null >/dev/null 2>&1 &
+  echo $! > "$SUPERVISOR_PIDFILE"
+  echo "Запущен защищенный супервайзер Sentinel Station"
+}
+
+stop() {
+  # Остановка супервайзера и дочернего процесса
+  if [ -f "$SUPERVISOR_PIDFILE" ]; then
+    SUP_PID=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null)
+    [ -n "$SUP_PID" ] && kill -9 "$SUP_PID" 2>/dev/null
+    rm -f "$SUPERVISOR_PIDFILE"
+  fi
+  killall -9 sentinel-station 2>/dev/null
+  cleanup_ipc
+  echo "Sentinel Station остановлен"
 }
 
 case "$1" in
@@ -15,10 +102,10 @@ case "$1" in
     start
     ;;
   stop)
-    killall sentinel-station 2>/dev/null
+    stop
     ;;
   restart)
-    killall sentinel-station 2>/dev/null
+    stop
     sleep 1
     start
     ;;
@@ -26,7 +113,11 @@ case "$1" in
     if pidof sentinel-station >/dev/null 2>&1; then
       echo "running (PID: $(pidof sentinel-station))"
     else
-      echo "stopped"
+      if [ -f "$DISABLED" ]; then
+        echo "stopped (disabled by kill-switch $DISABLED)"
+      else
+        echo "stopped"
+      fi
     fi
     ;;
   *)
