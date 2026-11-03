@@ -70,6 +70,33 @@ pub struct StationConfig {
     /// Стиль анимации переключения треков: "random", "curtain", "tape", "slot", "chevron"
     #[serde(default = "default_track_animation_style")]
     pub track_animation_style: String,
+
+    /// Режим работы эквалайзера спектра при воспроизведении музыки:
+    /// "always" (по умолчанию) — показывать спектр постоянно при игре музыки,
+    /// "intro" — показывать спектр 10 секунд при старте трека, затем часы,
+    /// "off" — всегда отображать часы, спектр отключен
+    #[serde(default = "default_equalizer_mode")]
+    pub equalizer_mode: String,
+
+    /// Уровень программной громкости музыки при активности Алисы (Audio Ducking, от 0.0 до 1.0, по умолчанию 0.15)
+    #[serde(default = "default_ducking_volume")]
+    pub ducking_volume: f32,
+
+    /// Воспроизводить голосовое приветствие при старте демона (по умолчанию false — тихий запуск)
+    #[serde(default = "default_false")]
+    pub startup_greeting: bool,
+}
+
+fn default_ducking_volume() -> f32 {
+    0.15
+}
+
+fn default_equalizer_mode() -> String {
+    "always".to_string()
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_track_animation_style() -> String {
@@ -143,6 +170,9 @@ impl Default for StationConfig {
             display_brightness: default_brightness(),
             timezone_offset_hours: default_timezone_offset(),
             track_animation_style: default_track_animation_style(),
+            equalizer_mode: default_equalizer_mode(),
+            ducking_volume: default_ducking_volume(),
+            startup_greeting: false,
         }
     }
 }

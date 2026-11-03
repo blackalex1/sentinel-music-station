@@ -21,7 +21,7 @@ use connect::{ConnectClient, PlayerCommand, PlayerState};
 use input::{HardwareButtonController, VoiceInterceptor};
 use tui::TuiApp;
 use visualizer::led_clock::TrackAnimStyle;
-use visualizer::{DisplayCommand, DisplayManager};
+use visualizer::{DisplayCommand, DisplayManager, EqualizerMode};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -42,7 +42,11 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Запуск в режиме фонового демона (по умолчанию)
-    Start,
+    Start {
+        /// Тихий запуск без звукового приветствия в динамик (для автозапуска супервайзером)
+        #[arg(long)]
+        quiet: bool,
+    },
 
     /// Запуск интерактивного консольного терминала (TUI) через SSH
     Tui,
@@ -120,7 +124,7 @@ async fn main() -> Result<()> {
         .context("Ошибка инициализации файла конфигурации")?;
     let config = Arc::new(cfg);
 
-    match cli.command.unwrap_or(Commands::Start) {
+    match cli.command.unwrap_or(Commands::Start { quiet: false }) {
         Commands::Config => {
             println!("--- ТЕКУЩАЯ КОНФИГУРАЦИЯ SENTINEL STATION ---");
             println!("{}", toml::to_string_pretty(&*config)?);
@@ -133,7 +137,10 @@ async fn main() -> Result<()> {
             println!("Имя устройства: {}", config.device_name);
             println!("ID устройства: {}", config.device_id);
 
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
             let health_url = format!("{}/api/system/version", config.server_url.trim_end_matches('/'));
             match client.get(&health_url).timeout(Duration::from_secs(5)).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -166,6 +173,7 @@ async fn main() -> Result<()> {
                 let (_, dummy_rx) = mpsc::channel(4);
                 let (_, is_active_rx) = watch::channel(true);
                 let track_style = TrackAnimStyle::from_str_opt(&config.track_animation_style);
+                let eq_mode = EqualizerMode::from_str_opt(&config.equalizer_mode);
                 tokio::spawn(async move {
                     let display_mgr = DisplayManager::new(
                         sample_buf_clone,
@@ -175,6 +183,7 @@ async fn main() -> Result<()> {
                         tz_offset,
                         is_active_rx,
                         track_style,
+                        eq_mode,
                     );
                     display_mgr.run_loop().await;
                 });
@@ -196,6 +205,9 @@ async fn main() -> Result<()> {
                 position_ms: 0,
                 auto_play: true,
                 queue: Vec::new(),
+                is_preview: false,
+                candidate_id: None,
+                cover_url: None,
             }).await?;
 
             tokio::spawn(async move {
@@ -213,7 +225,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Start => {
+        Commands::Start { quiet } => {
             cleanup_stale_alsa_ipc();
             let mut attempts = 0;
             let (_stream, stream_handle) = loop {
@@ -235,7 +247,7 @@ async fn main() -> Result<()> {
                     }
                 }
             };
-            run_daemon(config, stream_handle).await
+            run_daemon(config, stream_handle, quiet).await
         }
         Commands::Tui => {
             run_tui_mode(config).await
@@ -244,7 +256,11 @@ async fn main() -> Result<()> {
 }
 
 /// Запуск в режиме фонового демона
-async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandle) -> Result<()> {
+async fn run_daemon(
+    config: Arc<StationConfig>,
+    stream_handle: OutputStreamHandle,
+    quiet: bool,
+) -> Result<()> {
     info!("Запуск демона Sentinel Station v{} (ALSA Native)", env!("CARGO_PKG_VERSION"));
     info!("Имя устройства в Sentinel Connect: '{}'", config.device_name);
     info!("Аудиовыход: '{}'", config.audio_device);
@@ -265,9 +281,9 @@ async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandl
                 if !*is_active_tx_clone.borrow() {
                     info!("⚡ Удаленная команда запуска трека/Потока: автоматическое пробуждение Sentinel Station!");
                     let _ = is_active_tx_clone.send(true);
-                    VoiceInterceptor::stop_alice_playback();
                     let _ = display_tx_clone.send(DisplayCommand::Active).await;
                 }
+                VoiceInterceptor::stop_alice_playback();
             }
             if player_cmd_tx.send(cmd).await.is_err() {
                 break;
@@ -294,6 +310,7 @@ async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandl
         let tz_offset = config.timezone_offset_hours;
         let is_active_rx_clone = is_active_rx.clone();
         let track_style = TrackAnimStyle::from_str_opt(&config.track_animation_style);
+        let eq_mode = EqualizerMode::from_str_opt(&config.equalizer_mode);
         tokio::spawn(async move {
             let display_mgr = DisplayManager::new(
                 sample_buf_clone,
@@ -303,13 +320,20 @@ async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandl
                 tz_offset,
                 is_active_rx_clone,
                 track_style,
+                eq_mode,
             );
             display_mgr.run_loop().await;
         });
 
         let display_tx_init = display_tx.clone();
+        let play_greeting = !quiet && config.startup_greeting;
         tokio::spawn(async move {
-            let _ = display_tx_init.send(DisplayCommand::Active).await;
+            let cmd = if play_greeting {
+                DisplayCommand::Active
+            } else {
+                DisplayCommand::ActiveQuiet
+            };
+            let _ = display_tx_init.send(cmd).await;
         });
     }
 
@@ -347,6 +371,9 @@ async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandl
         is_connected_tx,
     );
 
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+
     tokio::select! {
         _ = client.run_supervisor() => {
             info!("Супервайзер подключения завершил работу.");
@@ -356,6 +383,17 @@ async fn run_daemon(config: Arc<StationConfig>, stream_handle: OutputStreamHandl
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Получен сигнал завершения (SIGINT/Ctrl+C). Остановка Sentinel Station...");
+        }
+        _ = async {
+            #[cfg(unix)]
+            if let Some(ref mut sig) = sigterm {
+                sig.recv().await;
+                return;
+            }
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await;
+        } => {
+            info!("Получен сигнал завершения (SIGTERM). Остановка Sentinel Station...");
         }
     }
 
@@ -390,7 +428,10 @@ async fn run_tui_mode(config: Arc<StationConfig>) -> Result<()> {
     });
 
     // Фоновая пересылка команд TUI через REST API целевой колонке
-    let http_client = reqwest::Client::new();
+    let http_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let target_device_id = config.device_id.clone();
     let server_url = config.server_url.clone();
     let auth_token = config.auth_token.clone();
@@ -411,6 +452,7 @@ async fn run_tui_mode(config: Arc<StationConfig>) -> Result<()> {
                 PlayerCommand::SetRepeat { mode } => ("REPEAT", serde_json::json!({ "mode": mode })),
                 PlayerCommand::PlayTrack { track_id, .. } => ("PLAY_TRACK", serde_json::json!({ "track_id": track_id })),
                 PlayerCommand::StartFlow => ("START_FLOW", serde_json::json!({})),
+                PlayerCommand::Duck { ducked } => ("DUCK", serde_json::json!({ "ducked": ducked })),
             };
 
             let mut req = http_client.post(&command_endpoint)

@@ -1,6 +1,7 @@
 #!/bin/sh
 # ==============================================================================
 # Sentinel Station Init & Supervisor Script with Circuit Breaker (Fail-Safe)
+# and Active Network Self-Healing Multi-Tier Watchdog
 # ==============================================================================
 DIR=/data/opt/sentinel-station
 BIN=$DIR/bin/sentinel-station
@@ -9,29 +10,135 @@ LOG=$DIR/logs/station.log
 DISABLED=$DIR/disabled
 CRASH_LOG=/tmp/sentinel-station.crashes
 SUPERVISOR_PIDFILE=/var/run/sentinel-supervisor.pid
+WATCHDOG_PIDFILE=/var/run/sentinel-watchdog.pid
 
 cleanup_ipc() {
+  # Если аппаратный аудиовыход удерживается mediad на старте/перезапуске,
+  # мягко сбрасываем mediad (quasar_launcher2 поднимет его чистым за 0.1с без захвата ALSA)
+  if fuser /dev/snd/pcmC0D0p >/dev/null 2>&1; then
+    for p in $(fuser /dev/snd/pcmC0D0p 2>/dev/null); do
+      if [ -f "/proc/$p/cmdline" ] && grep -q -- "--mediad" "/proc/$p/cmdline" 2>/dev/null; then
+        echo "[supervisor] Освобождение ALSA от зависшего mediad (PID $p)..." >> "$LOG"
+        kill -9 "$p" 2>/dev/null
+        sleep 1
+      fi
+    done
+  fi
+
   for s in $(ipcs -s 2>/dev/null | awk '$1=="0x00000400"{print $2}'); do ipcrm -s "$s" 2>/dev/null; done
   for m in $(ipcs -m 2>/dev/null | awk '$1=="0x00000400"||$1=="0x00000401"{print $2}'); do ipcrm -m "$m" 2>/dev/null; done
+}
+
+network_watchdog() {
+  # Активный многоуровневый самовосстанавливающийся сторож Wi-Fi сети
+  FAIL_COUNT=0
+  while true; do
+    sleep 15
+
+    # 1. Проверяем состояние Wi-Fi ассоциации (wpa_supplicant)
+    WPA_STATE=$(wpa_cli status 2>/dev/null | sed -n 's/^wpa_state=//p')
+
+    # 2. Проверяем пинг до шлюза (роутера)
+    GATEWAY=$(ip route 2>/dev/null | sed -n 's/.*default via \([0-9.]*\).*/\1/p' | head -n 1)
+    [ -z "$GATEWAY" ] && GATEWAY="192.168.1.1"
+
+    IS_NET_OK=1
+    if [ "$WPA_STATE" != "COMPLETED" ]; then
+      IS_NET_OK=0
+    elif ! ping -c 1 -w 2 "$GATEWAY" >/dev/null 2>&1; then
+      # Двойная проверка через сервер Sentinel Connect
+      if ! ping -c 1 -w 2 192.168.1.97 >/dev/null 2>&1; then
+        IS_NET_OK=0
+      fi
+    fi
+
+    if [ "$IS_NET_OK" -eq 1 ]; then
+      FAIL_COUNT=0
+      continue
+    fi
+
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "[network-watchdog] ⚠️ Потеря связи с сетью #$FAIL_COUNT (WPA: $WPA_STATE, Шлюз: $GATEWAY)" >> "$LOG"
+
+    # Шаг 1 (15 сек): Быстрая переассоциация с лучшей точкой Mesh и обновление DHCP
+    if [ "$FAIL_COUNT" -eq 1 ]; then
+      wpa_cli reassociate >/dev/null 2>&1
+      dhcpcd -n wlan0 >/dev/null 2>&1
+    # Шаг 2 (30 сек): Принудительный reconnect wpa_supplicant и рестарт DHCP
+    elif [ "$FAIL_COUNT" -eq 2 ]; then
+      echo "[network-watchdog] Принудительный reconnect wpa_supplicant и рестарт DHCP..." >> "$LOG"
+      wpa_cli reconnect >/dev/null 2>&1
+      /etc/init.d/S41dhcpcd restart >/dev/null 2>&1
+    # Шаг 3 (45-60 сек): Полный аппаратный сброс Wi-Fi чипа (power cycle SDIO + перезагрузка драйвера)
+    elif [ "$FAIL_COUNT" -ge 3 ]; then
+      echo "[network-watchdog] 🚨 Аппаратный перезапуск Wi-Fi чипа Unisoc (SDIO power cycle)..." >> "$LOG"
+      /etc/init.d/S40wifi restart >/dev/null 2>&1
+      sleep 4
+      /etc/init.d/S41dhcpcd restart >/dev/null 2>&1
+      FAIL_COUNT=0
+    fi
+  done
 }
 
 supervisor_loop() {
   mkdir -p "$DIR/logs"
   echo "[supervisor] Запуск защищенного супервайзера Sentinel Station (PID $$)" >> "$LOG"
 
+  # Запуск сетевого сторожа
+  network_watchdog </dev/null >/dev/null 2>&1 &
+  NET_WATCHDOG_PID=$!
+  echo "$NET_WATCHDOG_PID" > "$WATCHDOG_PIDFILE"
+
   while true; do
     # 1. Проверка защитного флага отключения (kill-switch)
     if [ -f "$DISABLED" ]; then
       echo "[supervisor] Обнаружен файл $DISABLED. Сервис деактивирован." >> "$LOG"
+      if [ -f "$WATCHDOG_PIDFILE" ]; then
+        kill -9 $(cat "$WATCHDOG_PIDFILE" 2>/dev/null) 2>/dev/null
+        rm -f "$WATCHDOG_PIDFILE"
+      fi
       rm -f "$SUPERVISOR_PIDFILE"
       exit 0
     fi
 
-    # 2. Предохранитель от частых падений (Circuit Breaker):
-    # Не более 4 падений за последние 60 секунд
+    cleanup_ipc
+
+    START_TIME=$(date +%s)
+
+    # 2. Запуск демона с приоритетом nice -10 (защита звука ALSA от задержек CPU)
+    # и флагом --quiet (тихий запуск без лишнего звукового приветствия посреди ночи)
+    nice -n -10 "$BIN" --config "$CONF" start --quiet >> "$LOG" 2>&1 &
+    DAEMON_PID=$!
+
+    # 3. Защита от OOM Killer: запретить ядру Linux убивать Sentinel при нехватке RAM
+    if [ -d "/proc/$DAEMON_PID" ]; then
+      echo -900 > "/proc/$DAEMON_PID/oom_score_adj" 2>/dev/null
+    fi
+
+    # Ожидание завершения работы демона
+    wait "$DAEMON_PID"
+    EXIT_CODE=$?
+    END_TIME=$(date +%s)
+    RUN_DURATION=$((END_TIME - START_TIME))
+
+    # Если сервис остановлен штатно (код 0), очищаем историю аварий
+    if [ "$EXIT_CODE" -eq 0 ]; then
+      rm -f "$CRASH_LOG"
+      sleep 2
+      continue
+    fi
+
+    # Если процесс стабильно проработал дольше 60 секунд — сбрасываем старые счетчики аварий
+    if [ "$RUN_DURATION" -gt 60 ]; then
+      rm -f "$CRASH_LOG"
+    fi
+
+    # Фиксируем timestamp аварии
     NOW=$(date +%s)
     echo "$NOW" >> "$CRASH_LOG"
-    
+
+    # Предохранитель от частых падений (Circuit Breaker):
+    # Не более 4 падений подряд за последние 60 секунд
     CUTOFF=$((NOW - 60))
     RECENT_CRASHES=0
     if [ -f "$CRASH_LOG" ]; then
@@ -49,18 +156,7 @@ supervisor_loop() {
       continue
     fi
 
-    cleanup_ipc
-
-    # 3. Запуск демона с нормальным приоритетом CPU (без задержек для аудиопотока ALSA)
-    "$BIN" --config "$CONF" start >> "$LOG" 2>&1
-    EXIT_CODE=$?
-
-    # Если сервис остановлен штатно (код 0), очищаем историю аварий
-    if [ "$EXIT_CODE" -eq 0 ]; then
-      rm -f "$CRASH_LOG"
-    fi
-
-    # Защитная пауза 2 сек перед повторным запуском
+    # Защитная пауза перед повторным запуском
     sleep 2
   done
 }
@@ -85,13 +181,29 @@ start() {
 }
 
 stop() {
-  # Остановка супервайзера и дочернего процесса
+  # 1. Остановка сетевого сторожа
+  if [ -f "$WATCHDOG_PIDFILE" ]; then
+    WD_PID=$(cat "$WATCHDOG_PIDFILE" 2>/dev/null)
+    [ -n "$WD_PID" ] && kill -9 "$WD_PID" 2>/dev/null
+    rm -f "$WATCHDOG_PIDFILE"
+  fi
+
+  # 2. Остановка супервайзера
   if [ -f "$SUPERVISOR_PIDFILE" ]; then
     SUP_PID=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null)
     [ -n "$SUP_PID" ] && kill -9 "$SUP_PID" 2>/dev/null
     rm -f "$SUPERVISOR_PIDFILE"
   fi
-  killall -9 sentinel-station 2>/dev/null
+
+  # 3. Мягкая остановка демона (SIGTERM)
+  killall -15 sentinel-station 2>/dev/null
+  sleep 1
+
+  # Принудительное завершение только если процесс завис
+  if pidof sentinel-station >/dev/null 2>&1; then
+    killall -9 sentinel-station 2>/dev/null
+  fi
+
   cleanup_ipc
   echo "Sentinel Station остановлен"
 }

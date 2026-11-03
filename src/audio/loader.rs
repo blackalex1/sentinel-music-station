@@ -50,6 +50,30 @@ impl TrackLoader {
         Ok(audio_bytes)
     }
 
+    /// Загрузка аудиопотока предпрослушивания кандидата по HTTP
+    pub async fn download_candidate_preview(&self, candidate_id: &str) -> Result<bytes::Bytes> {
+        let preview_url = format!("{}/api/tracks/candidates/preview", self.config.server_url.trim_end_matches('/'));
+        info!("Загрузка превью трека-кандидата с: {} (ID: {})", preview_url, candidate_id);
+
+        let mut request = self.http_client.get(&preview_url).query(&[("candidate_id", candidate_id)]);
+        if !self.config.auth_token.is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", self.config.auth_token));
+        }
+
+        let response = request.send().await
+            .with_context(|| format!("Не удалось отправить запрос к {}", preview_url))?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Сервер вернул ошибку при запросе предпрослушивания: HTTP {}", response.status());
+        }
+
+        let audio_bytes = response.bytes().await
+            .context("Ошибка чтения тела аудиопотока предпрослушивания")?;
+
+        info!("Загружено {} байт превью-аудио. Декодирование...", audio_bytes.len());
+        Ok(audio_bytes)
+    }
+
     /// Запрос списка треков с сервера при отсутствии локальной очереди
     pub async fn fetch_server_tracks(&self) -> Result<Vec<TrackMeta>> {
         let tracks_url = format!("{}/api/tracks?limit=50", self.config.server_url.trim_end_matches('/'));

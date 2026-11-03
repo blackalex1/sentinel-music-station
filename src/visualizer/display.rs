@@ -18,6 +18,7 @@ pub enum DisplayCommand {
     Play,
     Standby,
     Active,
+    ActiveQuiet,
     Flow,
     PassThrough,
     PassThroughResume,
@@ -43,6 +44,23 @@ enum TransitionSequence {
     Flow(Instant),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EqualizerMode {
+    Always,
+    Intro,
+    Off,
+}
+
+impl EqualizerMode {
+    pub fn from_str_opt(s: &str) -> Self {
+        match s.to_lowercase().trim() {
+            "intro" => EqualizerMode::Intro,
+            "off" | "false" | "none" => EqualizerMode::Off,
+            _ => EqualizerMode::Always,
+        }
+    }
+}
+
 /// Менеджер экрана и кольца подсветки Яндекс Станции Мини 2:
 /// - Эквалайзер частот (спектр FFT) во время воспроизведения на фронтальном экране
 /// - Значок паузы || при постановке на паузу
@@ -58,6 +76,7 @@ pub struct DisplayManager {
     timezone_offset_hours: i32,
     is_active_rx: watch::Receiver<bool>,
     track_style: TrackAnimStyle,
+    equalizer_mode: EqualizerMode,
     random_counter: usize,
 }
 
@@ -70,6 +89,7 @@ impl DisplayManager {
         timezone_offset_hours: i32,
         is_active_rx: watch::Receiver<bool>,
         track_style: TrackAnimStyle,
+        equalizer_mode: EqualizerMode,
     ) -> Self {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -83,6 +103,7 @@ impl DisplayManager {
             timezone_offset_hours,
             is_active_rx,
             track_style,
+            equalizer_mode,
             random_counter: seed % 4,
         }
     }
@@ -132,6 +153,8 @@ impl DisplayManager {
             None
         };
         let mut showing_equalizer = false;
+        let mut frame_count: u32 = 0;
+        let mut is_passthrough = false;
 
         loop {
             ticker.tick().await;
@@ -140,6 +163,7 @@ impl DisplayManager {
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 match cmd {
                     DisplayCommand::Volume(vol) => {
+                        is_passthrough = false;
                         clock_driver.invalidate();
                         let pct = (vol.clamp(0.0, 1.0) * 100.0).round() as u32;
                         let until = Instant::now() + Duration::from_millis(1800);
@@ -148,47 +172,60 @@ impl DisplayManager {
                         last_volume = vol;
                     }
                     DisplayCommand::NextTrack => {
+                        is_passthrough = false;
                         clock_driver.invalidate();
                         let style = self.pick_track_style();
                         track_anim = Some(TrackAnimation::Next { start: Instant::now(), style });
                     }
                     DisplayCommand::PrevTrack => {
+                        is_passthrough = false;
                         clock_driver.invalidate();
                         let style = self.pick_track_style();
                         track_anim = Some(TrackAnimation::Prev { start: Instant::now(), style });
                     }
                     DisplayCommand::Pause => {
+                        is_passthrough = false;
                         clock_driver.invalidate();
                         paused_at = Some(Instant::now());
                         action_ring_flash = Some(((0xE8, 0x00, 0xF3), Instant::now())); // Фиолетовая вспышка
                         equalizer_until = None;
                     }
                     DisplayCommand::Play => {
+                        is_passthrough = false;
                         clock_driver.invalidate();
                         paused_at = None;
                         action_ring_flash = Some(((0x00, 0xEE, 0x80), Instant::now())); // Неоново-изумрудная вспышка
                         equalizer_until = Some(Instant::now() + Duration::from_secs(5));
                     }
                     DisplayCommand::Standby => {
+                        is_passthrough = false;
                         clock_driver.invalidate();
                         transition_seq = Some(TransitionSequence::Deactivation(Instant::now()));
                         Self::play_feedback_sound("/data/opt/sentinel-station/sounds/alice_return.wav");
                     }
                     DisplayCommand::Active => {
+                        is_passthrough = false;
                         clock_driver.invalidate();
                         transition_seq = Some(TransitionSequence::Activation(Instant::now()));
                         Self::play_feedback_sound("/data/opt/sentinel-station/sounds/sentinel_online.wav");
                     }
+                    DisplayCommand::ActiveQuiet => {
+                        is_passthrough = false;
+                        clock_driver.invalidate();
+                        transition_seq = Some(TransitionSequence::Activation(Instant::now()));
+                    }
                     DisplayCommand::Flow => {
+                        is_passthrough = false;
                         clock_driver.invalidate();
                         transition_seq = Some(TransitionSequence::Flow(Instant::now()));
                     }
                     DisplayCommand::PassThrough => {
+                        is_passthrough = true;
                         transition_seq = None;
-                        ring_driver.turn_off();
                         clock_driver.invalidate();
                     }
                     DisplayCommand::PassThroughResume => {
+                        is_passthrough = false;
                         transition_seq = None;
                         clock_driver.invalidate();
                     }
@@ -257,7 +294,9 @@ impl DisplayManager {
             let mut is_animating_track = false;
             let mut is_in_transition = false;
 
-            if let Some(trans) = transition_seq {
+            if is_passthrough {
+                skip_render = true;
+            } else if let Some(trans) = transition_seq {
                 match trans {
                     TransitionSequence::Activation(start) => {
                         let elapsed_ms = start.elapsed().as_millis();
@@ -390,10 +429,17 @@ impl DisplayManager {
                     }
                 }
 
-                // Приоритет 3: Воспроизведение трека -> Эквалайзер частот (первые 5 секунд) или Часы
+                // Приоритет 3: Воспроизведение трека -> Эквалайзер частот или Часы
                 if !is_animating_track && !is_showing_volume {
-                    let should_show_equalizer = state.is_playing
-                        && equalizer_until.map(|u| Instant::now() < u).unwrap_or(false);
+                    let should_show_equalizer = if !state.is_playing {
+                        false
+                    } else {
+                        match self.equalizer_mode {
+                            EqualizerMode::Always => true,
+                            EqualizerMode::Intro => equalizer_until.map(|u| Instant::now() < u).unwrap_or(false),
+                            EqualizerMode::Off => false,
+                        }
+                    };
 
                     // При переходе между эквалайзером и часами сбрасываем кэш сегментов для чистой перерисовки
                     if should_show_equalizer != showing_equalizer {
@@ -421,16 +467,18 @@ impl DisplayManager {
                             frame = Self::render_clock_frame(self.timezone_offset_hours);
                         }
                     } else {
-                        // Музыка играет, но 5 секунд эквалайзера уже прошли -> показываем часы HH:MM!
+                        // Музыка играет, но режим Intro (время вышло) или Off -> показываем часы HH:MM!
                         frame = Self::render_clock_frame(self.timezone_offset_hours);
                     }
                 }
             }
         }
 
+            frame_count = frame_count.wrapping_add(1);
+
             // 4. Отрисовка кадра на фронтальном LED-экране Станции
             if !skip_render {
-                if is_in_transition {
+                if is_in_transition || showing_equalizer || (frame_count % 60 == 0) {
                     clock_driver.force_render(&frame, self.brightness);
                 } else {
                     clock_driver.render(&frame, self.brightness);
@@ -439,7 +487,10 @@ impl DisplayManager {
 
             // 5. Отрисовка подсветки кнопки (RGB-кольцо)
             let now = Instant::now();
-            if is_in_transition {
+            if is_passthrough {
+                // В режиме уступки экрана Алисе (PassThrough) не вмешиваемся в работу кольца подсветки:
+                // Алиса сама отображает свое вращающееся фиолетовое кольцо активации/ожидания
+            } else if is_in_transition {
                 if let Some(trans) = transition_seq {
                     match trans {
                         TransitionSequence::Activation(start) => {
@@ -510,7 +561,7 @@ impl DisplayManager {
                         TransitionSequence::Flow(start) => {
                             let elapsed_ms = start.elapsed().as_millis();
                             if elapsed_ms < 1800 {
-                                // Волновой поток: циан-изумрудная волна по кольцу
+                                // Анимация Потока: циан-изумрудная спираль по кольцу
                                 let phase = ((elapsed_ms / 80) % 6) as usize;
                                 let mut ring_colors = [(0u8, 0u8, 0u8); 6];
                                 ring_colors[phase] = (0x00, 0xF5, 0xD4); // Бирюзовый

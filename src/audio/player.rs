@@ -28,6 +28,7 @@ pub struct AudioPlayer {
     current_track_id: Option<i64>,
     is_flow_active: bool,
     recent_flow_ids: Vec<i64>,
+    is_ducked: bool,
 }
 
 impl AudioPlayer {
@@ -63,6 +64,7 @@ impl AudioPlayer {
             current_track_id: None,
             is_flow_active: false,
             recent_flow_ids: Vec::new(),
+            is_ducked: false,
         })
     }
 
@@ -78,16 +80,39 @@ impl AudioPlayer {
                 // Обработка команд управления (Play, Pause, Seek, Volume, Queue)
                 Some(cmd) = self.command_rx.recv() => {
                     match cmd {
-                        PlayerCommand::PlayTrack { track_id, title, artist, duration_ms, position_ms, auto_play, queue } => {
-                            info!("Запуск трека ID: {} - '{}' / '{}' (позиция: {} мс, auto_play: {})", track_id, title, artist, position_ms, auto_play);
+                        PlayerCommand::PlayTrack {
+                            track_id,
+                            title,
+                            artist,
+                            duration_ms,
+                            position_ms,
+                            auto_play,
+                            queue,
+                            is_preview,
+                            candidate_id,
+                            cover_url,
+                        } => {
+                            info!("Запуск трека ID: {} (preview: {}) - '{}' / '{}' (позиция: {} мс, auto_play: {})", track_id, is_preview, title, artist, position_ms, auto_play);
                             self.is_flow_active = false;
                             self.recent_flow_ids.clear();
                             self.queue.set_queue(queue, track_id);
 
-                            match self.load_and_play_track_at(track_id, position_ms, auto_play).await {
+                            let stream_res = if is_preview && candidate_id.is_some() {
+                                self.load_and_play_candidate_preview(candidate_id.as_deref().unwrap(), position_ms, auto_play).await
+                            } else {
+                                self.load_and_play_track_at(track_id, position_ms, auto_play).await
+                            };
+
+                            match stream_res {
                                 Ok(()) => {
                                     track_started_at = if auto_play { Some(Instant::now()) } else { None };
                                     accumulated_position = Duration::from_millis(position_ms);
+
+                                    let resolved_cover = cover_url.or_else(|| if track_id > 0 {
+                                        Some(format!("{}/api/covers/{}", self.config.server_url.trim_end_matches('/'), track_id))
+                                    } else {
+                                        None
+                                    });
 
                                     let mut state = self.state_tx.borrow().clone();
                                     state.is_playing = auto_play;
@@ -101,7 +126,9 @@ impl AudioPlayer {
                                         artist,
                                         album: None,
                                         duration: Some(duration_ms as f64 / 1000.0),
-                                        cover_url: Some(format!("{}/api/covers/{}", self.config.server_url.trim_end_matches('/'), track_id)),
+                                        cover_url: resolved_cover,
+                                        is_preview,
+                                        candidate_id,
                                     });
                                     let _ = self.state_tx.send(state);
                                 }
@@ -121,7 +148,7 @@ impl AudioPlayer {
                                 }
                                 if let Some(track) = self.queue.current().cloned() {
                                     let dur_ms = track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
-                                    if let Ok(()) = self.load_and_play_track(track.id).await {
+                                    if let Ok(()) = self.load_and_play_meta(&track).await {
                                         track_started_at = Some(Instant::now());
                                         accumulated_position = Duration::ZERO;
                                         let mut state = self.state_tx.borrow().clone();
@@ -179,7 +206,7 @@ impl AudioPlayer {
                                 }
                                 if let Some(track) = self.queue.current().cloned() {
                                     let dur_ms = track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
-                                    if let Ok(()) = self.load_and_play_track(track.id).await {
+                                    if let Ok(()) = self.load_and_play_meta(&track).await {
                                         track_started_at = Some(Instant::now());
                                         accumulated_position = Duration::ZERO;
                                         let mut state = self.state_tx.borrow().clone();
@@ -258,13 +285,22 @@ impl AudioPlayer {
                         PlayerCommand::SetVolume { volume } => {
                             let clamped = volume.clamp(0.0, 1.0);
                             info!("🔊 Установка громкости: {:.0}%", clamped * 100.0);
+                            let vol = if self.is_ducked { self.config.ducking_volume } else { 1.0 };
                             if let Ok(sink) = self.sink.lock() {
-                                sink.set_volume(1.0);
+                                sink.set_volume(vol);
                             }
                             set_hardware_volume(clamped);
                             let mut state = self.state_tx.borrow().clone();
                             state.volume = clamped;
                             let _ = self.state_tx.send(state);
+                        }
+                        PlayerCommand::Duck { ducked } => {
+                            self.is_ducked = ducked;
+                            let vol = if ducked { self.config.ducking_volume } else { 1.0 };
+                            info!("🔉 Приглушение музыки для Алисы (Audio Ducking): ducked={}, volume={:.0}%", ducked, vol * 100.0);
+                            if let Ok(sink) = self.sink.lock() {
+                                sink.set_volume(vol);
+                            }
                         }
                         PlayerCommand::StartFlow => {
                             info!("🌊 Активация режима Поток (Flow / Vibe Stream)");
@@ -346,7 +382,7 @@ impl AudioPlayer {
                                 }
                                 if let Some(next_track) = self.queue.next() {
                                     let dur_ms = next_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
-                                    if let Ok(()) = self.load_and_play_track(next_track.id).await {
+                                    if let Ok(()) = self.load_and_play_meta(&next_track).await {
                                         track_started_at = Some(Instant::now());
                                         accumulated_position = Duration::ZERO;
                                         let mut state = self.state_tx.borrow().clone();
@@ -369,7 +405,7 @@ impl AudioPlayer {
                             }
                             if let Some(prev_track) = self.queue.prev() {
                                 let dur_ms = prev_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
-                                if let Ok(()) = self.load_and_play_track(prev_track.id).await {
+                                if let Ok(()) = self.load_and_play_meta(&prev_track).await {
                                     track_started_at = Some(Instant::now());
                                     accumulated_position = Duration::ZERO;
                                     let mut state = self.state_tx.borrow().clone();
@@ -435,7 +471,7 @@ impl AudioPlayer {
                                 if let Some(cur) = state.current_track.clone() {
                                     info!("🔁 Повтор текущего трека: '{}'", cur.title);
                                     let dur_ms = cur.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
-                                    if let Ok(()) = self.load_and_play_track(cur.id).await {
+                                    if let Ok(()) = self.load_and_play_meta(&cur).await {
                                         track_started_at = Some(Instant::now());
                                         accumulated_position = Duration::ZERO;
                                         state.is_playing = true;
@@ -486,7 +522,7 @@ impl AudioPlayer {
                             if let Some(next_track) = self.queue.next() {
                                 info!("Автовоспроизведение следующего трека: '{}'", next_track.title);
                                 let dur_ms = next_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
-                                if let Ok(()) = self.load_and_play_track(next_track.id).await {
+                                if let Ok(()) = self.load_and_play_meta(&next_track).await {
                                     track_started_at = Some(Instant::now());
                                     accumulated_position = Duration::ZERO;
                                     state.is_playing = true;
@@ -514,13 +550,10 @@ impl AudioPlayer {
         }
     }
 
-    /// Загрузка аудиоданных по сети и добавление в Sink плеера с указанной позиции и статусом auto_play
-    async fn load_and_play_track_at(&mut self, track_id: i64, position_ms: u64, auto_play: bool) -> Result<()> {
+    /// Воспроизведение подготовленных байтов аудиопотока
+    fn play_audio_bytes(&mut self, audio_bytes: bytes::Bytes, position_ms: u64, auto_play: bool) -> Result<()> {
         sync_hardware_routing(&mut self.jack_state, &self.config.audio_routing);
-
-        let audio_bytes = self.loader.download_stream(track_id).await?;
         self.current_audio_data = Some(audio_bytes.clone());
-        self.current_track_id = Some(track_id);
 
         if position_ms > 0 {
             self.seek_and_play(audio_bytes, position_ms, auto_play)
@@ -547,7 +580,8 @@ impl AudioPlayer {
                 sink.stop();
                 let new_sink = Sink::try_new(&self.stream_handle)
                     .context("Не удалось пересоздать Sink")?;
-                new_sink.set_volume(1.0);
+                let vol = if self.is_ducked { self.config.ducking_volume } else { 1.0 };
+                new_sink.set_volume(vol);
                 new_sink.append(buffered_source);
                 if auto_play {
                     new_sink.play();
@@ -561,9 +595,32 @@ impl AudioPlayer {
         }
     }
 
+    /// Загрузка аудиоданных по сети и добавление в Sink плеера с указанной позиции и статусом auto_play
+    async fn load_and_play_track_at(&mut self, track_id: i64, position_ms: u64, auto_play: bool) -> Result<()> {
+        let audio_bytes = self.loader.download_stream(track_id).await?;
+        self.current_track_id = Some(track_id);
+        self.play_audio_bytes(audio_bytes, position_ms, auto_play)
+    }
+
+    /// Загрузка аудиопотока предпрослушивания кандидата и добавление в Sink плеера
+    async fn load_and_play_candidate_preview(&mut self, candidate_id: &str, position_ms: u64, auto_play: bool) -> Result<()> {
+        let audio_bytes = self.loader.download_candidate_preview(candidate_id).await?;
+        self.current_track_id = None;
+        self.play_audio_bytes(audio_bytes, position_ms, auto_play)
+    }
+
     /// Загрузка аудиоданных по сети и немедленное воспроизведение с начала
     async fn load_and_play_track(&mut self, track_id: i64) -> Result<()> {
         self.load_and_play_track_at(track_id, 0, true).await
+    }
+
+    /// Загрузка и запуск трека на основе метаданных (с поддержкой предпрослушивания кандидатов)
+    async fn load_and_play_meta(&mut self, track: &TrackMeta) -> Result<()> {
+        if track.is_preview && track.candidate_id.is_some() {
+            self.load_and_play_candidate_preview(track.candidate_id.as_deref().unwrap(), 0, true).await
+        } else {
+            self.load_and_play_track(track.id).await
+        }
     }
 
     /// Перемотка трека на заданную позицию без повторного скачивания по сети
@@ -607,7 +664,8 @@ impl AudioPlayer {
             sink.stop();
             let new_sink = Sink::try_new(&self.stream_handle)
                 .context("Не удалось пересоздать Sink для перемотки")?;
-            new_sink.set_volume(1.0);
+            let vol = if self.is_ducked { self.config.ducking_volume } else { 1.0 };
+            new_sink.set_volume(vol);
             new_sink.append(buffered_source);
             if auto_play {
                 new_sink.play();

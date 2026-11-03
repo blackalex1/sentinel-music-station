@@ -377,6 +377,25 @@ impl ConnectClient {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
 
+                let is_preview = payload.get("is_preview")
+                    .and_then(|v| v.as_bool())
+                    .or_else(|| payload.get("isPreview").and_then(|v| v.as_bool()))
+                    .or_else(|| track_obj.and_then(|t| t.get("is_preview")).and_then(|v| v.as_bool()))
+                    .or_else(|| track_obj.and_then(|t| t.get("isPreview")).and_then(|v| v.as_bool()))
+                    .unwrap_or(track_id < 0);
+
+                let candidate_id = payload.get("candidate_id")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .or_else(|| payload.get("candidateId").and_then(|v| v.as_str().map(|s| s.to_string())))
+                    .or_else(|| track_obj.and_then(|t| t.get("candidate_id")).and_then(|v| v.as_str().map(|s| s.to_string())))
+                    .or_else(|| track_obj.and_then(|t| t.get("candidateId")).and_then(|v| v.as_str().map(|s| s.to_string())));
+
+                let cover_url = payload.get("cover_url")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .or_else(|| payload.get("coverUrl").and_then(|v| v.as_str().map(|s| s.to_string())))
+                    .or_else(|| track_obj.and_then(|t| t.get("cover_url")).and_then(|v| v.as_str().map(|s| s.to_string())))
+                    .or_else(|| track_obj.and_then(|t| t.get("coverUrl")).and_then(|v| v.as_str().map(|s| s.to_string())));
+
                 Some(PlayerCommand::PlayTrack {
                     track_id,
                     title,
@@ -385,6 +404,9 @@ impl ConnectClient {
                     position_ms,
                     auto_play,
                     queue,
+                    is_preview,
+                    candidate_id,
+                    cover_url,
                 })
             }
             _ => {

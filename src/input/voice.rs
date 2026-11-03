@@ -1,6 +1,8 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -10,8 +12,15 @@ use crate::visualizer::DisplayCommand;
 
 #[cfg(unix)]
 fn get_file_ino(file: &File) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    file.metadata().ok().map(|m| m.ino())
+    use std::os::unix::io::AsRawFd;
+    let mut stat_buf = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let res = unsafe { libc::fstat(file.as_raw_fd(), stat_buf.as_mut_ptr()) };
+    if res == 0 {
+        let s = unsafe { stat_buf.assume_init() };
+        Some(s.st_ino as u64)
+    } else {
+        None
+    }
 }
 
 #[cfg(not(unix))]
@@ -20,13 +29,22 @@ fn get_file_ino(_file: &File) -> Option<u64> {
 }
 
 #[cfg(unix)]
-fn get_path_ino(path: &std::path::Path) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| m.ino())
+fn get_path_stat(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat_buf = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let res = unsafe { libc::stat(c_path.as_ptr(), stat_buf.as_mut_ptr()) };
+    if res == 0 {
+        let s = unsafe { stat_buf.assume_init() };
+        Some((s.st_ino as u64, s.st_size as u64))
+    } else {
+        None
+    }
 }
 
 #[cfg(not(unix))]
-fn get_path_ino(_path: &std::path::Path) -> Option<u64> {
+fn get_path_stat(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 
@@ -36,6 +54,7 @@ pub struct VoiceInterceptor {
     state_rx: watch::Receiver<PlayerState>,
     display_tx: mpsc::Sender<DisplayCommand>,
     is_active_tx: watch::Sender<bool>,
+    is_ducked: Arc<AtomicBool>,
     log_path: PathBuf,
 }
 
@@ -52,6 +71,7 @@ impl VoiceInterceptor {
             state_rx,
             display_tx,
             is_active_tx,
+            is_ducked: Arc::new(AtomicBool::new(false)),
             log_path: PathBuf::from("/data/quasar/daemons_logs/maind.log"),
         }
     }
@@ -89,7 +109,7 @@ impl VoiceInterceptor {
         tokio::spawn(async {
             let res = tokio::process::Command::new("sh")
                 .arg("-c")
-                .arg("(sleep 0.1; echo o; echo c; sleep 0.2; echo x) | LD_LIBRARY_PATH=/system/vendor/quasar/libs /system/vendor/quasar/maind --cli >/dev/null 2>&1")
+                .arg("{ sleep 0.2; echo o; sleep 0.1; echo c; sleep 0.1; echo x; } | LD_LIBRARY_PATH=/system/vendor/quasar/libs /system/vendor/quasar/maind --cli >/dev/null 2>&1")
                 .status()
                 .await;
             if let Ok(status) = res {
@@ -158,10 +178,13 @@ impl VoiceInterceptor {
 
         // Перемещаемся в конец файла, чтобы обрабатывать только новые голосовые события
         let _ = file.seek(SeekFrom::End(0));
+        let mut curr_file_ino = get_file_ino(&file);
         let mut reader = BufReader::new(file);
 
         let mut last_phrase = String::new();
         let mut last_phrase_time = Instant::now();
+        let mut last_rotation_check = Instant::now();
+        let mut duck_start_time: Option<Instant> = None;
 
         let mut line_buffer = String::new();
 
@@ -169,37 +192,56 @@ impl VoiceInterceptor {
             line_buffer.clear();
             match reader.read_line(&mut line_buffer) {
                 Ok(0) => {
-                    // Конец файла (EOF): проверяем ротацию файла по смене inode или уменьшению размера
-                    let should_reopen = match fs::metadata(&self.log_path) {
-                        Ok(meta) => {
-                            let path_ino = get_path_ino(&self.log_path);
-                            let curr_ino = get_file_ino(reader.get_ref());
-                            let ino_changed = match (path_ino, curr_ino) {
-                                (Some(p), Some(c)) => p != c,
-                                _ => false,
-                            };
-                            let size_dropped = match reader.stream_position() {
-                                Ok(pos) => meta.len() < pos,
-                                Err(_) => false,
-                            };
-                            ino_changed || size_dropped
-                        }
-                        Err(_) => false,
-                    };
+                    // Конец файла (EOF): проверяем ротацию файла не чаще одного раза в 5 секунд (защита от statx flood)
+                    let now = Instant::now();
+                    if now.duration_since(last_rotation_check) >= Duration::from_secs(5) {
+                        last_rotation_check = now;
 
-                    if should_reopen {
-                        if let Ok(mut new_file) = File::open(&self.log_path) {
-                            // Если новый файл уже накопил много строк (ротация была давно),
-                            // прыгаем к хвосту, чтобы не воспроизводить старые команды
-                            if let Ok(meta) = new_file.metadata() {
-                                if meta.len() > 16384 {
-                                    let _ = new_file.seek(SeekFrom::End(0));
-                                }
+                        let should_reopen = match get_path_stat(&self.log_path) {
+                            Some((path_ino, path_size)) => {
+                                let ino_changed = match (Some(path_ino), curr_file_ino) {
+                                    (Some(p), Some(c)) => p != c,
+                                    _ => false,
+                                };
+                                let size_dropped = match reader.stream_position() {
+                                    Ok(pos) => path_size < pos,
+                                    Err(_) => false,
+                                };
+                                ino_changed || size_dropped
                             }
-                            reader = BufReader::new(new_file);
+                            None => false,
+                        };
+
+                        if should_reopen {
+                            if let Ok(mut new_file) = File::open(&self.log_path) {
+                                curr_file_ino = get_file_ino(&new_file);
+                                if let Ok(pos) = new_file.seek(SeekFrom::End(0)) {
+                                    if pos > 16384 {
+                                        let _ = new_file.seek(SeekFrom::End(0));
+                                    }
+                                }
+                                reader = BufReader::new(new_file);
+                            }
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    // Защита от зависания приглушения: авто-восстановление громкости через 15 сек
+                    if self.is_ducked.load(Ordering::SeqCst) {
+                        if let Some(start_t) = duck_start_time {
+                            if start_t.elapsed() > Duration::from_secs(15) {
+                                self.is_ducked.store(false, Ordering::SeqCst);
+                                duck_start_time = None;
+                                info!("⏰ Таймаут активности Алисы (15 сек) истек: восстанавливаем громкость и экран Sentinel Music");
+                                let player_tx = self.player_tx.clone();
+                                let display_tx = self.display_tx.clone();
+                                tokio::spawn(async move {
+                                    let _ = player_tx.send(PlayerCommand::Duck { ducked: false }).await;
+                                    let _ = display_tx.send(DisplayCommand::PassThroughResume).await;
+                                });
+                            }
+                        }
+                    }
+
+                    tokio::time::sleep(Duration::from_millis(150)).await;
                 }
                 Ok(_) => {
                     let line = line_buffer.trim();
@@ -209,6 +251,39 @@ impl VoiceInterceptor {
 
                     let lower = line.to_lowercase();
                     let prev_busy = in_call || in_alarm_or_timer;
+
+                    // 0. Отслеживание активности Алисы и приглушение звука (Audio Ducking)
+                    let is_alice_activation = (line.contains("onPhraseSpotted:") && line.contains("activation"))
+                        || line.contains("onAliceStateChanged: LISTENING")
+                        || line.contains("onAliceStateChanged: BUSY")
+                        || line.contains("onAliceStateChanged: SPEAKING");
+
+                    let is_alice_idle = line.contains("onAliceStateChanged: IDLE")
+                        || line.contains("stopConversation");
+
+                    if is_alice_activation {
+                        if !self.is_ducked.swap(true, Ordering::SeqCst) {
+                            duck_start_time = Some(Instant::now());
+                            info!("🎙️ Обнаружена активность Алисы: приглушаем Sentinel Music и уступаем экран Алисе");
+                            let player_tx = self.player_tx.clone();
+                            let display_tx = self.display_tx.clone();
+                            tokio::spawn(async move {
+                                let _ = player_tx.send(PlayerCommand::Duck { ducked: true }).await;
+                                let _ = display_tx.send(DisplayCommand::PassThrough).await;
+                            });
+                        }
+                    } else if is_alice_idle {
+                        if self.is_ducked.swap(false, Ordering::SeqCst) {
+                            duck_start_time = None;
+                            info!("🔊 Диалог Алисы завершен: восстанавливаем громкость Sentinel Music и возвращаем экран");
+                            let player_tx = self.player_tx.clone();
+                            let display_tx = self.display_tx.clone();
+                            tokio::spawn(async move {
+                                let _ = player_tx.send(PlayerCommand::Duck { ducked: false }).await;
+                                let _ = display_tx.send(DisplayCommand::PassThroughResume).await;
+                            });
+                        }
+                    }
 
                     // 1. Отслеживание состояния телефонных звонков (PJSIP / WebRTC)
                     if Self::is_call_start(&lower) {
@@ -269,31 +344,42 @@ impl VoiceInterceptor {
                         });
                     }
 
-                    // 3. Распознавание голосовых команд Алисы
-                    if line.contains("recognizedPhrase='") {
-                        if let Some(phrase) = Self::extract_recognized_phrase(line) {
-                            let now = Instant::now();
-                            // Защита от дублирования одной и той же фразы в пределах 1 секунды
-                            if phrase == last_phrase && now.duration_since(last_phrase_time) < Duration::from_millis(1000) {
-                                continue;
-                            }
-                            last_phrase = phrase.clone();
-                            last_phrase_time = now;
+                    // 3. Распознавание голосовых команд Алисы и локальных быстрых команд (Spotter)
+                    let phrase_opt = if line.contains("recognizedPhrase='") {
+                        Self::extract_recognized_phrase(line)
+                    } else if let Some(idx) = line.find("Command phrase spotted: ") {
+                        let spotted = line[idx + "Command phrase spotted: ".len()..].trim().to_lowercase();
+                        if spotted.is_empty() {
+                            None
+                        } else {
+                            Some(spotted)
+                        }
+                    } else {
+                        None
+                    };
 
-                            // Явные команды активации Sentinel или запуска Потока обрабатываются ВСЕГДА,
-                            // даже если флаг звонка или будильника остался активным из-за бага
-                            let is_wake = Self::is_activation_phrase(&phrase) || Self::is_flow_phrase(&phrase);
-                            if is_wake {
-                                if curr_busy {
-                                    info!("⚡ Явная команда активации/Потока '{}' сбрасывает флаг занятости", phrase);
-                                    in_call = false;
-                                    in_alarm_or_timer = false;
-                                    alarm_start_time = None;
-                                }
-                                self.handle_voice_phrase(&phrase);
-                            } else if !curr_busy {
-                                self.handle_voice_phrase(&phrase);
+                    if let Some(phrase) = phrase_opt {
+                        let now = Instant::now();
+                        // Защита от дублирования одной и той же фразы в пределах 2 секунд (например spotter + cloud ASR)
+                        if phrase == last_phrase && now.duration_since(last_phrase_time) < Duration::from_millis(2000) {
+                            continue;
+                        }
+                        last_phrase = phrase.clone();
+                        last_phrase_time = now;
+
+                        // Явные команды активации Sentinel или запуска Потока обрабатываются ВСЕГДА,
+                        // даже если флаг звонка или будильника остался активным из-за бага
+                        let is_wake = Self::is_activation_phrase(&phrase) || Self::is_flow_phrase(&phrase);
+                        if is_wake {
+                            if curr_busy {
+                                info!("⚡ Явная команда активации/Потока '{}' сбрасывает флаг занятости", phrase);
+                                in_call = false;
+                                in_alarm_or_timer = false;
+                                alarm_start_time = None;
                             }
+                            self.handle_voice_phrase(&phrase);
+                        } else if !curr_busy {
+                            self.handle_voice_phrase(&phrase);
                         }
                     }
                 }
@@ -426,8 +512,10 @@ impl VoiceInterceptor {
             || p == "мой поток"
             || p == "музыкальный поток"
             || p == "поток музыки"
+            || p.starts_with("поток")
             || p.starts_with("включи поток")
             || p.starts_with("запусти поток")
+            || p.starts_with("поставь поток")
             || p.starts_with("мой поток")
             || p.starts_with("включи мой поток")
             || p.starts_with("запусти мой поток")
@@ -490,6 +578,7 @@ impl VoiceInterceptor {
         if Self::is_deactivation_phrase(phrase) {
             info!("💤 Голосовая команда: ДЕАКТИВАЦИЯ Sentinel Station (переход в режим ожидания/Алисы)");
             Self::stop_alice_playback();
+            self.is_ducked.store(false, Ordering::SeqCst);
             let _ = self.is_active_tx.send(false);
 
             let player_tx = self.player_tx.clone();
@@ -506,6 +595,7 @@ impl VoiceInterceptor {
             info!("⚡ Голосовая команда: АКТИВАЦИЯ Sentinel Station (возврат управления плеером)");
             let _ = self.is_active_tx.send(true);
             Self::stop_alice_playback();
+            self.is_ducked.store(false, Ordering::SeqCst);
 
             let display_tx = self.display_tx.clone();
             tokio::spawn(async move {
@@ -524,6 +614,7 @@ impl VoiceInterceptor {
 
             info!("🌊 Перехвачена голосовая команда запуска Потока: '{}'", phrase);
             Self::stop_alice_playback();
+            self.is_ducked.store(false, Ordering::SeqCst);
 
             // Воспроизводим локальное подтверждение "Включаю Поток."
             tokio::spawn(async move {
@@ -542,6 +633,7 @@ impl VoiceInterceptor {
             let display_tx = self.display_tx.clone();
             tokio::spawn(async move {
                 let _ = display_tx.send(DisplayCommand::Flow).await;
+                let _ = player_tx.send(PlayerCommand::Duck { ducked: false }).await;
                 let _ = player_tx.send(PlayerCommand::StartFlow).await;
             });
             return;
@@ -581,6 +673,9 @@ impl VoiceInterceptor {
             || phrase == "включи трек"
             || phrase == "включи песню"
             || phrase == "включи плейлист"
+            || phrase == "вруби музыку"
+            || phrase == "вруби песню"
+            || phrase == "вруби трек"
             || phrase == "поставь музыку"
             || phrase == "поставь песню"
             || phrase == "поставь трек"
@@ -589,23 +684,25 @@ impl VoiceInterceptor {
             || phrase == "запусти песню"
             || phrase == "запусти трек"
             || phrase == "играй музыку"
+            || phrase == "играй"
             || phrase == "музыка"
+            || phrase == "воспроизведи"
             || phrase == "продолжи"
             || phrase == "продолжить"
             || phrase == "продолжи воспроизведение"
             || phrase == "продолжай"
-            || phrase.starts_with("включи музыку")
-            || phrase.starts_with("поставь музыку")
-            || phrase.starts_with("запусти музыку")
-            || phrase.starts_with("играй музыку")
-            || phrase.starts_with("включи трек ")
-            || phrase.starts_with("поставь трек ")
-            || phrase.starts_with("запусти трек ")
-            || phrase.starts_with("включи песню ")
-            || phrase.starts_with("поставь песню ")
-            || phrase.starts_with("запусти песню ")
-            || phrase.starts_with("включи плейлист ")
-            || phrase.starts_with("поставь плейлист ")
+            || phrase == "ремикс"
+            || phrase.starts_with("включи ")
+            || phrase.starts_with("вруби ")
+            || phrase.starts_with("поставь ")
+            || phrase.starts_with("запусти ")
+            || phrase.starts_with("играй ")
+            || phrase.starts_with("сыграй ")
+            || phrase.starts_with("ремикс")
+            || phrase.starts_with("музыку ")
+            || phrase.starts_with("трек ")
+            || phrase.starts_with("песню ")
+            || phrase.starts_with("плейлист ")
         );
 
         if is_music_cmd {
@@ -614,13 +711,18 @@ impl VoiceInterceptor {
             let player_tx = self.player_tx.clone();
             let display_tx = self.display_tx.clone();
 
-            // Даем Алисе 2.2 секунды, чтобы она полностью закончила фразу ("Включаю музыку"),
-            // после чего отменяем воспроизведение в Яндекс.Музыке и запускаем трек в Sentinel
+            // Немедленно останавливаем штатную Алису и запускаем Sentinel Music без задержек,
+            // чтобы родной плеер Алисы не успел запуститься и наложиться на музыку Sentinel.
+            Self::stop_alice_playback();
+            self.is_ducked.store(false, Ordering::SeqCst);
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(2200)).await;
-                Self::stop_alice_playback();
                 let _ = display_tx.send(DisplayCommand::Play).await;
+                let _ = player_tx.send(PlayerCommand::Duck { ducked: false }).await;
                 let _ = player_tx.send(PlayerCommand::Play).await;
+
+                // Повторный сброс через 800мс на случай отложенного ответа облака Яндекса
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                Self::stop_alice_playback();
             });
             return;
         }
@@ -636,10 +738,13 @@ impl VoiceInterceptor {
             || phrase == "тишина"
         {
             info!("⏸️ Перехвачена команда паузы: '{}'", phrase);
+            Self::stop_alice_playback();
+            self.is_ducked.store(false, Ordering::SeqCst);
             let player_tx = self.player_tx.clone();
             let display_tx = self.display_tx.clone();
             tokio::spawn(async move {
                 let _ = display_tx.send(DisplayCommand::Pause).await;
+                let _ = player_tx.send(PlayerCommand::Duck { ducked: false }).await;
                 let _ = player_tx.send(PlayerCommand::Pause).await;
             });
             return;
@@ -656,11 +761,16 @@ impl VoiceInterceptor {
             || phrase == "вперед"
         {
             info!("⏭️ Перехвачена команда перехода к следующему треку: '{}'", phrase);
+            Self::stop_alice_playback();
+            self.is_ducked.store(false, Ordering::SeqCst);
             let player_tx = self.player_tx.clone();
             let display_tx = self.display_tx.clone();
             tokio::spawn(async move {
                 let _ = display_tx.send(DisplayCommand::NextTrack).await;
+                let _ = player_tx.send(PlayerCommand::Duck { ducked: false }).await;
                 let _ = player_tx.send(PlayerCommand::Next).await;
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                Self::stop_alice_playback();
             });
             return;
         }
@@ -673,17 +783,31 @@ impl VoiceInterceptor {
             || phrase == "назад"
         {
             info!("⏮️ Перехвачена команда перехода к предыдущему треку: '{}'", phrase);
+            Self::stop_alice_playback();
+            self.is_ducked.store(false, Ordering::SeqCst);
             let player_tx = self.player_tx.clone();
             let display_tx = self.display_tx.clone();
             tokio::spawn(async move {
                 let _ = display_tx.send(DisplayCommand::PrevTrack).await;
+                let _ = player_tx.send(PlayerCommand::Duck { ducked: false }).await;
                 let _ = player_tx.send(PlayerCommand::Prev).await;
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                Self::stop_alice_playback();
             });
             return;
         }
 
         // 5. Управление громкостью
-        if phrase == "громче" || phrase == "прибавь" || phrase == "прибавь громкость" {
+        if phrase == "громче"
+            || phrase == "прибавь"
+            || phrase == "прибавь громкость"
+            || phrase == "прибавить"
+            || phrase == "сделай громче"
+            || phrase == "добавь звук"
+            || phrase == "добавь громкости"
+        {
+            Self::stop_alice_playback();
+            self.is_ducked.store(false, Ordering::SeqCst);
             let current_vol = self.state_rx.borrow().volume;
             let new_vol = (current_vol + 0.10).min(1.0);
             info!("🔊 Перехвачена команда 'громче': {:.0}% -> {:.0}%", current_vol * 100.0, new_vol * 100.0);
@@ -691,12 +815,21 @@ impl VoiceInterceptor {
             let display_tx = self.display_tx.clone();
             tokio::spawn(async move {
                 let _ = display_tx.send(DisplayCommand::Volume(new_vol)).await;
+                let _ = player_tx.send(PlayerCommand::Duck { ducked: false }).await;
                 let _ = player_tx.send(PlayerCommand::SetVolume { volume: new_vol }).await;
             });
             return;
         }
 
-        if phrase == "тише" || phrase == "убавь" || phrase == "убавь громкость" {
+        if phrase == "тише"
+            || phrase == "убавь"
+            || phrase == "убавь громкость"
+            || phrase == "убавить"
+            || phrase == "сделай тише"
+            || phrase == "убавь звук"
+        {
+            Self::stop_alice_playback();
+            self.is_ducked.store(false, Ordering::SeqCst);
             let current_vol = self.state_rx.borrow().volume;
             let new_vol = (current_vol - 0.10).max(0.0);
             info!("🔉 Перехвачена команда 'тише': {:.0}% -> {:.0}%", current_vol * 100.0, new_vol * 100.0);
@@ -704,6 +837,7 @@ impl VoiceInterceptor {
             let display_tx = self.display_tx.clone();
             tokio::spawn(async move {
                 let _ = display_tx.send(DisplayCommand::Volume(new_vol)).await;
+                let _ = player_tx.send(PlayerCommand::Duck { ducked: false }).await;
                 let _ = player_tx.send(PlayerCommand::SetVolume { volume: new_vol }).await;
             });
             return;
@@ -711,17 +845,32 @@ impl VoiceInterceptor {
 
         // 6. Перемешивание (Shuffle)
         if phrase == "перемешай"
+            || phrase == "перемешать"
             || phrase == "перемешай треки"
+            || phrase == "перемешать треки"
             || phrase == "перемешай музыку"
+            || phrase == "перемешать музыку"
+            || phrase == "перемешай плейлист"
+            || phrase == "перемешать плейлист"
             || phrase == "включи перемешивание"
             || phrase == "случайный порядок"
+            || phrase == "в случайном порядке"
             || phrase == "вперемешку"
             || phrase == "шафл"
             || phrase == "шаффл"
+            || phrase == "включи шафл"
+            || phrase == "включи шаффл"
+            || phrase.starts_with("перемешай")
+            || phrase.starts_with("перемешать")
         {
             info!("🔀 Перехвачена команда перемешивания: '{}'", phrase);
+            Self::stop_alice_playback();
+            self.is_ducked.store(false, Ordering::SeqCst);
             let player_tx = self.player_tx.clone();
+            let display_tx = self.display_tx.clone();
             tokio::spawn(async move {
+                let _ = player_tx.send(PlayerCommand::Duck { ducked: false }).await;
+                let _ = display_tx.send(DisplayCommand::PassThroughResume).await;
                 let _ = player_tx.send(PlayerCommand::ToggleShuffle).await;
             });
             return;

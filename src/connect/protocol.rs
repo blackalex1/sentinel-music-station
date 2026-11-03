@@ -15,6 +15,10 @@ pub struct TrackMeta {
     pub duration: Option<f64>,
     #[serde(default)]
     pub cover_url: Option<String>,
+    #[serde(default)]
+    pub is_preview: bool,
+    #[serde(default)]
+    pub candidate_id: Option<String>,
 }
 
 fn default_volume() -> f32 {
@@ -147,6 +151,10 @@ pub enum PlayerCommand {
         position_ms: u64,
         auto_play: bool,
         queue: Vec<TrackMeta>,
+        is_preview: bool,
+        candidate_id: Option<String>,
+        cover_url: Option<String>,
     },
     StartFlow,
+    Duck { ducked: bool },
 }
