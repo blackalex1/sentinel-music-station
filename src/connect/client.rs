@@ -334,6 +334,16 @@ impl ConnectClient {
                     .to_string();
                 Some(PlayerCommand::SetRepeat { mode })
             }
+            "SET_QUEUE" | "UPDATE_QUEUE" => {
+                let queue: Vec<crate::connect::protocol::TrackMeta> = payload.get("queue")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let track_id = payload.get("track_id")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| payload.get("id").and_then(|v| v.as_i64()))
+                    .unwrap_or(0);
+                Some(PlayerCommand::SetQueue { queue, track_id })
+            }
             "PLAY_TRACK" | "PREPARE_TRACK" | "TRANSFER_PLAYBACK" => {
                 let track_obj = payload.get("track");
                 let queue: Vec<crate::connect::protocol::TrackMeta> = payload.get("queue")

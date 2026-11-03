@@ -132,4 +132,34 @@ impl TrackLoader {
 
         Ok(track)
     }
+
+    /// Запрос случайных треков со всего сервера (Server-side Shuffle)
+    pub async fn fetch_shuffled_tracks(&self, limit: usize, exclude_ids: &[i64]) -> Result<Vec<TrackMeta>> {
+        let mut url = format!(
+            "{}/api/tracks/shuffle?limit={}",
+            self.config.server_url.trim_end_matches('/'),
+            limit
+        );
+        if !exclude_ids.is_empty() {
+            let ids_str = exclude_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+            url.push_str(&format!("&exclude_ids={}", ids_str));
+        }
+
+        info!("Запрос случайных треков со всего сервера: {}", url);
+        let mut request = self.http_client.get(&url);
+        if !self.config.auth_token.is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", self.config.auth_token));
+        }
+
+        let response = request.send().await
+            .with_context(|| format!("Не удалось запросить случайные треки с {}", url))?;
+
+        if response.status().is_success() {
+            let tracks: Vec<TrackMeta> = response.json().await
+                .context("Ошибка разбора JSON случайных треков от сервера")?;
+            Ok(tracks)
+        } else {
+            anyhow::bail!("Сервер вернул статус HTTP {} при получении случайных треков", response.status());
+        }
+    }
 }

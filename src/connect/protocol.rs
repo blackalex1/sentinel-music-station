@@ -155,6 +155,10 @@ pub enum PlayerCommand {
         candidate_id: Option<String>,
         cover_url: Option<String>,
     },
+    SetQueue {
+        queue: Vec<TrackMeta>,
+        track_id: i64,
+    },
     StartFlow,
     Duck { ducked: bool },
 }

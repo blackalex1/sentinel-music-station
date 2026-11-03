@@ -104,6 +104,15 @@ impl AudioPlayer {
                             self.recent_flow_ids.clear();
                             self.queue.set_queue(queue, track_id);
 
+                            // Если включен режим Shuffle и в очереди мало треков (например, запуск из поиска):
+                            // сразу подтягиваем случайные треки со всего сервера
+                            if self.queue.is_shuffle() && !is_preview && self.queue.remaining() < 5 {
+                                if let Ok(shuffled) = self.loader.fetch_shuffled_tracks(50, &[track_id]).await {
+                                    info!("🔀 [Shuffle] Очередь дополнена случайными треками со всего сервера (всего: {} треков)", shuffled.len());
+                                    self.queue.append_tracks(shuffled);
+                                }
+                            }
+
                             let stream_res = if is_preview && candidate_id.is_some() {
                                 self.load_and_play_candidate_preview(candidate_id.as_deref().unwrap(), position_ms, auto_play).await
                             } else {
@@ -143,6 +152,18 @@ impl AudioPlayer {
                                     error!("Ошибка воспроизведения трека {}: {:#}", track_id, e);
                                 }
                             }
+                        }
+                        PlayerCommand::SetQueue { queue, track_id } => {
+                            info!("Получена обновленная очередь воспроизведения ({} треков, активный ID: {})", queue.len(), track_id);
+                            let cur_id = if track_id > 0 {
+                                track_id
+                            } else {
+                                self.state_tx.borrow().current_track.as_ref().map(|t| t.id).unwrap_or(0)
+                            };
+                            self.queue.set_queue(queue, cur_id);
+                            let mut state = self.state_tx.borrow().clone();
+                            state.queue = self.queue.tracks();
+                            let _ = self.state_tx.send(state);
                         }
                         PlayerCommand::Play => {
                             sync_hardware_routing(&mut self.jack_state, &self.config.audio_routing);
@@ -384,8 +405,17 @@ impl AudioPlayer {
                                 }
                             } else {
                                 if self.queue.is_empty() {
-                                    if let Ok(tracks) = self.loader.fetch_server_tracks().await {
+                                    if self.queue.is_shuffle() {
+                                        if let Ok(tracks) = self.loader.fetch_shuffled_tracks(50, &[]).await {
+                                            self.queue.set_queue(tracks, 0);
+                                        }
+                                    } else if let Ok(tracks) = self.loader.fetch_server_tracks().await {
                                         self.queue.set_queue(tracks, 0);
+                                    }
+                                } else if self.queue.is_shuffle() && self.queue.remaining() <= 2 {
+                                    let ids = self.queue.track_ids();
+                                    if let Ok(tracks) = self.loader.fetch_shuffled_tracks(30, &ids).await {
+                                        self.queue.append_tracks(tracks);
                                     }
                                 }
                                 if let Some(next_track) = self.queue.next() {
@@ -428,15 +458,29 @@ impl AudioPlayer {
                         }
                         PlayerCommand::ToggleShuffle => {
                             let new_shuffle = self.queue.toggle_shuffle();
+                            if new_shuffle && self.queue.remaining() < 5 {
+                                let cur_id = self.state_tx.borrow().current_track.as_ref().map(|t| t.id).unwrap_or(0);
+                                if let Ok(tracks) = self.loader.fetch_shuffled_tracks(50, &[cur_id]).await {
+                                    self.queue.append_tracks(tracks);
+                                }
+                            }
                             let mut state = self.state_tx.borrow().clone();
                             state.is_shuffle = new_shuffle;
+                            state.queue = self.queue.tracks();
                             info!("🔀 Режим перемешивания (Shuffle): {}", new_shuffle);
                             let _ = self.state_tx.send(state);
                         }
                         PlayerCommand::SetShuffle { enabled } => {
                             self.queue.set_shuffle(enabled);
+                            if enabled && self.queue.remaining() < 5 {
+                                let cur_id = self.state_tx.borrow().current_track.as_ref().map(|t| t.id).unwrap_or(0);
+                                if let Ok(tracks) = self.loader.fetch_shuffled_tracks(50, &[cur_id]).await {
+                                    self.queue.append_tracks(tracks);
+                                }
+                            }
                             let mut state = self.state_tx.borrow().clone();
                             state.is_shuffle = enabled;
+                            state.queue = self.queue.tracks();
                             info!("🔀 Установлен режим перемешивания (Shuffle): {}", enabled);
                             let _ = self.state_tx.send(state);
                         }
@@ -523,6 +567,14 @@ impl AudioPlayer {
                                     Err(e) => {
                                         error!("Ошибка автоперехода в Потоке: {:#}", e);
                                     }
+                                }
+                            }
+
+                            // Если включен режим Shuffle и очередь заканчивается — подгружаем новые треки со всего сервера
+                            if self.queue.is_shuffle() && self.queue.remaining() <= 2 {
+                                let ids = self.queue.track_ids();
+                                if let Ok(tracks) = self.loader.fetch_shuffled_tracks(30, &ids).await {
+                                    self.queue.append_tracks(tracks);
                                 }
                             }
 

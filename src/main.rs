@@ -457,6 +457,7 @@ async fn run_tui_mode(config: Arc<StationConfig>) -> Result<()> {
                 PlayerCommand::SetShuffle { enabled } => ("SHUFFLE", serde_json::json!({ "enabled": enabled })),
                 PlayerCommand::SetRepeat { mode } => ("REPEAT", serde_json::json!({ "mode": mode })),
                 PlayerCommand::PlayTrack { track_id, .. } => ("PLAY_TRACK", serde_json::json!({ "track_id": track_id })),
+                PlayerCommand::SetQueue { queue, track_id } => ("SET_QUEUE", serde_json::json!({ "queue": queue, "track_id": track_id })),
                 PlayerCommand::StartFlow => ("START_FLOW", serde_json::json!({})),
                 PlayerCommand::Duck { ducked } => ("DUCK", serde_json::json!({ "ducked": ducked })),
             };

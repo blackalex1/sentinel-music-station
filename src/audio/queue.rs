@@ -187,4 +187,46 @@ impl PlaybackQueue {
     pub fn tracks(&self) -> Vec<TrackMeta> {
         self.tracks.clone()
     }
+
+    /// Количество оставшихся треков в очереди после текущей позиции
+    pub fn remaining(&self) -> usize {
+        if self.order.is_empty() {
+            0
+        } else {
+            self.order.len().saturating_sub(self.current_index + 1)
+        }
+    }
+
+    /// Список ID всех треков в текущей очереди
+    pub fn track_ids(&self) -> Vec<i64> {
+        self.tracks.iter().map(|t| t.id).collect()
+    }
+
+    /// Добавление новых треков в конец очереди (с сохранением текущей позиции)
+    pub fn append_tracks(&mut self, mut new_tracks: Vec<TrackMeta>) {
+        if new_tracks.is_empty() {
+            return;
+        }
+        let existing_ids: std::collections::HashSet<i64> = self.tracks.iter().map(|t| t.id).collect();
+        new_tracks.retain(|t| !existing_ids.contains(&t.id));
+        if new_tracks.is_empty() {
+            return;
+        }
+
+        let old_len = self.tracks.len();
+        let mut new_indices: Vec<usize> = (old_len..(old_len + new_tracks.len())).collect();
+        self.tracks.append(&mut new_tracks);
+
+        if self.is_shuffle {
+            if new_indices.len() > 1 {
+                for i in (1..new_indices.len()).rev() {
+                    let j = self.rng.next_usize(i + 1);
+                    new_indices.swap(i, j);
+                }
+            }
+            self.order.extend(new_indices);
+        } else {
+            self.order.extend(new_indices);
+        }
+    }
 }
