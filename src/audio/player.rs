@@ -113,6 +113,33 @@ impl AudioPlayer {
                                 }
                             }
 
+                            // Мгновенное оповещение о выбранном треке в сеть и на LED-экран (до скачивания потока)
+                            let resolved_cover = cover_url.or_else(|| if track_id > 0 {
+                                Some(format!("{}/api/covers/{}", self.config.server_url.trim_end_matches('/'), track_id))
+                            } else {
+                                None
+                            });
+
+                            let track_meta = TrackMeta {
+                                id: track_id,
+                                title,
+                                artist,
+                                album: None,
+                                duration: Some(duration_ms as f64 / 1000.0),
+                                cover_url: resolved_cover,
+                                is_preview,
+                                candidate_id: candidate_id.clone(),
+                            };
+
+                            let mut pre_state = self.state_tx.borrow().clone();
+                            pre_state.is_playing = auto_play;
+                            pre_state.is_flow = false;
+                            pre_state.position_ms = position_ms;
+                            pre_state.duration_ms = duration_ms;
+                            pre_state.queue = self.queue.tracks();
+                            pre_state.current_track = Some(track_meta);
+                            let _ = self.state_tx.send(pre_state);
+
                             let stream_res = if is_preview && candidate_id.is_some() {
                                 self.load_and_play_candidate_preview(candidate_id.as_deref().unwrap(), position_ms, auto_play).await
                             } else {
@@ -123,29 +150,8 @@ impl AudioPlayer {
                                 Ok(()) => {
                                     track_started_at = if auto_play { Some(Instant::now()) } else { None };
                                     accumulated_position = Duration::from_millis(position_ms);
-
-                                    let resolved_cover = cover_url.or_else(|| if track_id > 0 {
-                                        Some(format!("{}/api/covers/{}", self.config.server_url.trim_end_matches('/'), track_id))
-                                    } else {
-                                        None
-                                    });
-
                                     let mut state = self.state_tx.borrow().clone();
                                     state.is_playing = auto_play;
-                                    state.is_flow = false;
-                                    state.position_ms = position_ms;
-                                    state.duration_ms = duration_ms;
-                                    state.queue = self.queue.tracks();
-                                    state.current_track = Some(TrackMeta {
-                                        id: track_id,
-                                        title,
-                                        artist,
-                                        album: None,
-                                        duration: Some(duration_ms as f64 / 1000.0),
-                                        cover_url: resolved_cover,
-                                        is_preview,
-                                        candidate_id,
-                                    });
                                     let _ = self.state_tx.send(state);
                                 }
                                 Err(e) => {
@@ -351,16 +357,20 @@ impl AudioPlayer {
                                     }
 
                                     let dur_ms = next_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
+                                    let mut state = self.state_tx.borrow().clone();
+                                    state.is_playing = true;
+                                    state.is_flow = true;
+                                    state.position_ms = 0;
+                                    state.duration_ms = dur_ms;
+                                    state.current_track = Some(next_track.clone());
+                                    state.queue = vec![next_track.clone()];
+                                    let _ = self.state_tx.send(state);
+
                                     if let Ok(()) = self.load_and_play_track(next_track.id).await {
                                         track_started_at = Some(Instant::now());
                                         accumulated_position = Duration::ZERO;
                                         let mut state = self.state_tx.borrow().clone();
                                         state.is_playing = true;
-                                        state.is_flow = true;
-                                        state.position_ms = 0;
-                                        state.duration_ms = dur_ms;
-                                        state.current_track = Some(next_track.clone());
-                                        state.queue = vec![next_track];
                                         let _ = self.state_tx.send(state);
                                     }
                                 }
@@ -386,16 +396,20 @@ impl AudioPlayer {
                                             self.recent_flow_ids.remove(0);
                                         }
                                         let dur_ms = next_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
+                                        let mut state = self.state_tx.borrow().clone();
+                                        state.is_playing = true;
+                                        state.is_flow = true;
+                                        state.position_ms = 0;
+                                        state.duration_ms = dur_ms;
+                                        state.current_track = Some(next_track.clone());
+                                        state.queue = vec![next_track.clone()];
+                                        let _ = self.state_tx.send(state);
+
                                         if let Ok(()) = self.load_and_play_track(next_track.id).await {
                                             track_started_at = Some(Instant::now());
                                             accumulated_position = Duration::ZERO;
                                             let mut state = self.state_tx.borrow().clone();
                                             state.is_playing = true;
-                                            state.is_flow = true;
-                                            state.position_ms = 0;
-                                            state.duration_ms = dur_ms;
-                                            state.current_track = Some(next_track.clone());
-                                            state.queue = vec![next_track];
                                             let _ = self.state_tx.send(state);
                                         }
                                     }
@@ -420,15 +434,21 @@ impl AudioPlayer {
                                 }
                                 if let Some(next_track) = self.queue.next() {
                                     let dur_ms = next_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
+
+                                    // Мгновенное оповещение сети и UI о выбранном треке (до скачивания аудио)
+                                    let mut state = self.state_tx.borrow().clone();
+                                    state.is_playing = true;
+                                    state.position_ms = 0;
+                                    state.duration_ms = dur_ms;
+                                    state.current_track = Some(next_track.clone());
+                                    state.queue = self.queue.tracks();
+                                    let _ = self.state_tx.send(state);
+
                                     if let Ok(()) = self.load_and_play_meta(&next_track).await {
                                         track_started_at = Some(Instant::now());
                                         accumulated_position = Duration::ZERO;
                                         let mut state = self.state_tx.borrow().clone();
                                         state.is_playing = true;
-                                        state.position_ms = 0;
-                                        state.duration_ms = dur_ms;
-                                        state.current_track = Some(next_track);
-                                        state.queue = self.queue.tracks();
                                         let _ = self.state_tx.send(state);
                                     }
                                 }
@@ -443,15 +463,21 @@ impl AudioPlayer {
                             }
                             if let Some(prev_track) = self.queue.prev() {
                                 let dur_ms = prev_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
+
+                                // Мгновенное оповещение сети и UI о выбранном треке (до скачивания аудио)
+                                let mut state = self.state_tx.borrow().clone();
+                                state.is_playing = true;
+                                state.position_ms = 0;
+                                state.duration_ms = dur_ms;
+                                state.current_track = Some(prev_track.clone());
+                                state.queue = self.queue.tracks();
+                                let _ = self.state_tx.send(state);
+
                                 if let Ok(()) = self.load_and_play_meta(&prev_track).await {
                                     track_started_at = Some(Instant::now());
                                     accumulated_position = Duration::ZERO;
                                     let mut state = self.state_tx.borrow().clone();
                                     state.is_playing = true;
-                                    state.position_ms = 0;
-                                    state.duration_ms = dur_ms;
-                                    state.current_track = Some(prev_track);
-                                    state.queue = self.queue.tracks();
                                     let _ = self.state_tx.send(state);
                                 }
                             }
@@ -551,16 +577,17 @@ impl AudioPlayer {
                                             self.recent_flow_ids.remove(0);
                                         }
                                         let dur_ms = next_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
+                                        state.is_playing = true;
+                                        state.is_flow = true;
+                                        state.position_ms = 0;
+                                        state.duration_ms = dur_ms;
+                                        state.current_track = Some(next_track.clone());
+                                        state.queue = vec![next_track.clone()];
+                                        let _ = self.state_tx.send(state.clone());
+
                                         if let Ok(()) = self.load_and_play_track(next_track.id).await {
                                             track_started_at = Some(Instant::now());
                                             accumulated_position = Duration::ZERO;
-                                            state.is_playing = true;
-                                            state.is_flow = true;
-                                            state.position_ms = 0;
-                                            state.duration_ms = dur_ms;
-                                            state.current_track = Some(next_track.clone());
-                                            state.queue = vec![next_track];
-                                            let _ = self.state_tx.send(state);
                                             continue;
                                         }
                                     }
@@ -582,14 +609,16 @@ impl AudioPlayer {
                             if let Some(next_track) = self.queue.next() {
                                 info!("Автовоспроизведение следующего трека: '{}'", next_track.title);
                                 let dur_ms = next_track.duration.map(|d| (d * 1000.0) as u64).unwrap_or(0);
+                                state.is_playing = true;
+                                state.position_ms = 0;
+                                state.duration_ms = dur_ms;
+                                state.current_track = Some(next_track.clone());
+                                state.queue = self.queue.tracks();
+                                let _ = self.state_tx.send(state.clone());
+
                                 if let Ok(()) = self.load_and_play_meta(&next_track).await {
                                     track_started_at = Some(Instant::now());
                                     accumulated_position = Duration::ZERO;
-                                    state.is_playing = true;
-                                    state.position_ms = 0;
-                                    state.duration_ms = dur_ms;
-                                    state.current_track = Some(next_track);
-                                    let _ = self.state_tx.send(state);
                                     continue;
                                 }
                             }
