@@ -162,7 +162,10 @@ async fn main() -> Result<()> {
                 .context("Не удалось открыть звуковое устройство ALSA/Audio")?;
 
             let (cmd_tx, cmd_rx) = mpsc::channel(32);
-            let (state_tx, mut state_rx) = watch::channel(PlayerState::default());
+            let initial_volume = audio::routing::load_persisted_volume().unwrap_or(config.initial_volume);
+            let mut initial_state = PlayerState::default();
+            initial_state.volume = initial_volume;
+            let (state_tx, mut state_rx) = watch::channel(initial_state);
             let sample_buffer = Arc::new(Mutex::new(Vec::with_capacity(4096)));
 
             if config.visualizer_enabled {
@@ -267,7 +270,10 @@ async fn run_daemon(
 
     let (cmd_tx, mut incoming_cmd_rx) = mpsc::channel::<PlayerCommand>(64);
     let (player_cmd_tx, player_cmd_rx) = mpsc::channel(64);
-    let (state_tx, state_rx) = watch::channel(PlayerState::default());
+    let initial_volume = audio::routing::load_persisted_volume().unwrap_or(config.initial_volume);
+    let mut initial_state = PlayerState::default();
+    initial_state.volume = initial_volume;
+    let (state_tx, state_rx) = watch::channel(initial_state);
     let (is_connected_tx, _) = watch::channel(false);
     let (display_tx, display_rx) = mpsc::channel(32);
     let (is_active_tx, is_active_rx) = watch::channel(true);

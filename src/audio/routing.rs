@@ -1,5 +1,37 @@
 use tracing::info;
 
+const PRIMARY_STATE_PATH: &str = "/data/opt/sentinel-station/volume.state";
+const FALLBACK_STATE_PATH: &str = "volume.state";
+
+/// Загружает сохраненную громкость из файла состояния на диске
+pub fn load_persisted_volume() -> Option<f32> {
+    for p in [PRIMARY_STATE_PATH, FALLBACK_STATE_PATH] {
+        if let Ok(content) = std::fs::read_to_string(p) {
+            if let Ok(vol) = content.trim().parse::<f32>() {
+                if (0.0..=1.0).contains(&vol) {
+                    tracing::info!("💾 Восстановлена сохраненная громкость: {:.0}% (из {})", vol * 100.0, p);
+                    return Some(vol);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Сохраняет текущую громкость в файл состояния на постоянном диске
+pub fn save_persisted_volume(vol: f32) {
+    let clamped = vol.clamp(0.0, 1.0);
+    let s = format!("{:.3}\n", clamped);
+    let path = if std::path::Path::new("/data/opt/sentinel-station").is_dir() {
+        PRIMARY_STATE_PATH
+    } else {
+        FALLBACK_STATE_PATH
+    };
+    if let Err(e) = std::fs::write(path, s) {
+        tracing::warn!("Не удалось сохранить громкость в {}: {}", path, e);
+    }
+}
+
 /// Проверяет, вставлен ли 3.5мм аудиокабель (AUX / наушники) в разъем колонки
 pub fn is_headphone_plugged() -> bool {
     let output = std::process::Command::new("amixer")

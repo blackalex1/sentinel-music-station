@@ -8,7 +8,7 @@ use tracing::{error, info};
 
 use crate::audio::loader::TrackLoader;
 use crate::audio::queue::PlaybackQueue;
-use crate::audio::routing::{set_hardware_volume, sync_hardware_routing};
+use crate::audio::routing::{load_persisted_volume, save_persisted_volume, set_hardware_volume, sync_hardware_routing};
 use crate::audio::source::BufferedStreamSource;
 use crate::config::StationConfig;
 use crate::connect::protocol::{PlayerCommand, PlayerState, TrackMeta};
@@ -46,7 +46,14 @@ impl AudioPlayer {
 
         let mut jack_state = None;
         sync_hardware_routing(&mut jack_state, &config.audio_routing);
-        set_hardware_volume(config.initial_volume);
+
+        let init_vol = load_persisted_volume().unwrap_or(config.initial_volume);
+        set_hardware_volume(init_vol);
+        {
+            let mut state = state_tx.borrow().clone();
+            state.volume = init_vol;
+            let _ = state_tx.send(state);
+        }
 
         let loader = TrackLoader::new(config.clone())?;
 
@@ -290,6 +297,7 @@ impl AudioPlayer {
                                 sink.set_volume(vol);
                             }
                             set_hardware_volume(clamped);
+                            save_persisted_volume(clamped);
                             let mut state = self.state_tx.borrow().clone();
                             state.volume = clamped;
                             let _ = self.state_tx.send(state);
