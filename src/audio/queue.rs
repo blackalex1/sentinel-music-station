@@ -116,6 +116,7 @@ impl PlaybackQueue {
     }
 
     /// Проверка статуса перемешивания
+    #[allow(dead_code)]
     pub fn is_shuffle(&self) -> bool {
         self.is_shuffle
     }

@@ -4,12 +4,14 @@ use std::path::PathBuf;
 use tracing::debug;
 
 /// Драйвер вывода спектрограммы на аппаратную LED-матрицу Яндекс Станции Мини 2
+#[allow(dead_code)]
 pub struct LedMatrixController {
     device_path: Option<PathBuf>,
     width: usize,
     height: usize,
 }
 
+#[allow(dead_code)]
 impl LedMatrixController {
     pub fn new(device_path: Option<String>, width: usize, height: usize) -> Self {
         Self {

@@ -386,10 +386,12 @@ impl DisplayFrame {
     }
 
     /// Базовая обратная совместимость
+    #[allow(dead_code)]
     pub fn next_track(step: usize) -> Self {
         Self::chevron_track(step, true)
     }
 
+    #[allow(dead_code)]
     pub fn prev_track(step: usize) -> Self {
         Self::chevron_track(step, false)
     }
@@ -524,6 +526,7 @@ impl LedHardwareDriver {
     }
 
     /// Полное погасание всех сегментов
+    #[allow(dead_code)]
     pub fn turn_off_all(&mut self) {
         if !self.is_available {
             return;

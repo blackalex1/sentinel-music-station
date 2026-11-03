@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 const BLOCKS: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 /// Отрисовка полос спектрограммы с использованием символов Unicode ( ▂▃▄▅▆▇█) в виде текста
+#[allow(dead_code)]
 pub fn render_ascii_bars(bands: &[f32], max_height: usize) -> String {
     if max_height <= 1 {
         return bands
