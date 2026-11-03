@@ -25,7 +25,7 @@ jobs:
         include:
           - target: armv7-unknown-linux-gnueabihf
             arch_name: armv7
-            zig_target: armv7-unknown-linux-gnueabihf.2.17
+            zig_target: armv7-unknown-linux-gnueabihf.2.30
             zig_cc_target: arm-linux-gnueabihf
             desc: "Яндекс.Станция (Мини 1/2, Лайт, Станция 2), Raspberry Pi 32-bit"
 
@@ -73,7 +73,7 @@ jobs:
       - name: Build Binary (${{ matrix.target }})
         run: |
           mkdir -p "libs/${{ matrix.arch_name }}"
-          zig cc -shared -o "libs/${{ matrix.arch_name }}/libasound.so" libs/armv7/stub.c -target ${{ matrix.zig_cc_target }}
+          zig cc -shared -Wl,-soname,libasound.so.2 -o "libs/${{ matrix.arch_name }}/libasound.so" libs/armv7/stub.c -target ${{ matrix.zig_cc_target }}
           chmod +x scripts/fake-pkg-config.sh
           export PKG_CONFIG="$(pwd)/scripts/fake-pkg-config.sh"
           export PKG_CONFIG_ALLOW_CROSS=1
