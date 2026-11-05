@@ -46,7 +46,11 @@ impl TuiApp {
     }
 
     /// Запуск цикла отрисовки TUI и обработки клавиш
-    pub async fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
+    pub async fn run<B>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
+    where
+        B: Backend,
+        B::Error: std::fmt::Display,
+    {
         let mut last_draw = std::time::Instant::now();
         let frame_duration = Duration::from_millis(33); // ~30 FPS
 
@@ -68,7 +72,7 @@ impl TuiApp {
 
             terminal.draw(|f| {
                 self.draw(f, &bands);
-            })?;
+            }).map_err(|e| anyhow::anyhow!("{e}"))?;
 
             // Обработка ввода с клавиатуры с таймаутом
             let elapsed = last_draw.elapsed();
