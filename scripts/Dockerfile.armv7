@@ -3,6 +3,7 @@ FROM rust:1.80-bullseye AS builder
 
 RUN dpkg --add-architecture armhf && \
     apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         gcc-arm-linux-gnueabihf \
         libc6-dev-armhf-cross \
@@ -28,3 +29,5 @@ RUN cargo build --target armv7-unknown-linux-gnueabihf --release
 
 FROM scratch AS export
 COPY --from=builder /build/target/armv7-unknown-linux-gnueabihf/release/sentinel-station /sentinel-station
+USER 1000:1000
+HEALTHCHECK NONE

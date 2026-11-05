@@ -24,7 +24,7 @@ url = "2.5"
 rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }
 symphonia = { version = "0.5", features = ["mp3", "flac", "wav", "aac", "isomp4"] }
 rustfft = "6.2"
-ratatui = "0.28"
+ratatui = "0.30"
 crossterm = "0.28"
 bytes = "1"
 libc = "0.2"
