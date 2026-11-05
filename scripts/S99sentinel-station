@@ -30,29 +30,37 @@ cleanup_ipc() {
 }
 
 network_watchdog() {
-  # Активный многоуровневый самовосстанавливающийся сторож Wi-Fi сети
+  # Интеллектуальный самовосстанавливающийся сторож Wi-Fi сети
   FAIL_COUNT=0
+
+  # Извлекаем IP сервера из конфигурации
+  SERVER_IP=$(sed -n 's/^[[:space:]]*server_url[[:space:]]*=[[:space:]]*"[^:]*:\/\/\([^:/]*\).*/\1/p' "$CONF" 2>/dev/null)
+  [ -z "$SERVER_IP" ] && SERVER_IP="192.168.1.97"
+
   while true; do
-    sleep 15
+    sleep 20
 
     # 1. Проверяем состояние Wi-Fi ассоциации (wpa_supplicant)
     WPA_STATE=$(wpa_cli status 2>/dev/null | sed -n 's/^wpa_state=//p')
 
-    # 2. Проверяем пинг до шлюза (роутера)
+    # 2. Проверяем шлюз по умолчанию
     GATEWAY=$(ip route 2>/dev/null | sed -n 's/.*default via \([0-9.]*\).*/\1/p' | head -n 1)
     [ -z "$GATEWAY" ] && GATEWAY="192.168.1.1"
 
     IS_NET_OK=1
     if [ "$WPA_STATE" != "COMPLETED" ]; then
       IS_NET_OK=0
-    elif ! ping -c 1 -w 2 "$GATEWAY" >/dev/null 2>&1; then
+    elif ! ping -c 2 -w 3 "$GATEWAY" >/dev/null 2>&1; then
       # Двойная проверка через сервер Sentinel Connect
-      if ! ping -c 1 -w 2 192.168.1.97 >/dev/null 2>&1; then
+      if ! ping -c 2 -w 3 "$SERVER_IP" >/dev/null 2>&1; then
         IS_NET_OK=0
       fi
     fi
 
     if [ "$IS_NET_OK" -eq 1 ]; then
+      if [ "$FAIL_COUNT" -gt 0 ]; then
+        echo "[network-watchdog] ✅ Связь с сетью успешно восстановлена (WPA: $WPA_STATE, Шлюз: $GATEWAY)" >> "$LOG"
+      fi
       FAIL_COUNT=0
       continue
     fi
@@ -60,22 +68,43 @@ network_watchdog() {
     FAIL_COUNT=$((FAIL_COUNT + 1))
     echo "[network-watchdog] ⚠️ Потеря связи с сетью #$FAIL_COUNT (WPA: $WPA_STATE, Шлюз: $GATEWAY)" >> "$LOG"
 
-    # Шаг 1 (15 сек): Быстрая переассоциация с лучшей точкой Mesh и обновление DHCP
-    if [ "$FAIL_COUNT" -eq 1 ]; then
+    # Не предпринимаем резких действий на кратковременные провалы (DFS / смену каналов роутером)
+    # Ждем минимум 3 цикла (60 секунд стабильного отсутствия связи)
+    if [ "$FAIL_COUNT" -lt 3 ]; then
+      continue
+    fi
+
+    # Шаг 1 (~60 сек): Мягкая переассоциация с точкой доступа и обновление DHCP
+    if [ "$FAIL_COUNT" -eq 3 ]; then
+      echo "[network-watchdog] 🔄 Мягкая переассоциация Wi-Fi (wpa_cli reassociate)..." >> "$LOG"
       wpa_cli reassociate >/dev/null 2>&1
       dhcpcd -n wlan0 >/dev/null 2>&1
-    # Шаг 2 (30 сек): Принудительный reconnect wpa_supplicant и рестарт DHCP
-    elif [ "$FAIL_COUNT" -eq 2 ]; then
-      echo "[network-watchdog] Принудительный reconnect wpa_supplicant и рестарт DHCP..." >> "$LOG"
+      sleep 10
+    # Шаг 2 (~100-120 сек): Принудительный reconnect wpa_supplicant и мягкий рестарт DHCP
+    elif [ "$FAIL_COUNT" -eq 5 ]; then
+      echo "[network-watchdog] 🔄 Принудительный reconnect wpa_supplicant и рестарт DHCP..." >> "$LOG"
+      wpa_cli disconnect >/dev/null 2>&1
+      sleep 2
       wpa_cli reconnect >/dev/null 2>&1
       /etc/init.d/S41dhcpcd restart >/dev/null 2>&1
-    # Шаг 3 (45-60 сек): Полный аппаратный сброс Wi-Fi чипа (power cycle SDIO + перезагрузка драйвера)
-    elif [ "$FAIL_COUNT" -ge 3 ]; then
-      echo "[network-watchdog] 🚨 Аппаратный перезапуск Wi-Fi чипа Unisoc (SDIO power cycle)..." >> "$LOG"
-      /etc/init.d/S40wifi restart >/dev/null 2>&1
-      sleep 4
+      sleep 15
+    # Шаг 3 (~200 сек = ~3.5 мин): Перезапуск служб wpa_supplicant и dhcpcd (БЕЗ выгрузки драйверов ядра)
+    elif [ "$FAIL_COUNT" -eq 9 ]; then
+      echo "[network-watchdog] 🔄 Перезапуск служб wpa_supplicant и dhcpcd..." >> "$LOG"
+      start-stop-daemon -K -x /usr/sbin/wpa_supplicant -p /var/run/wpa_supplicant.pid -o 2>/dev/null
+      sleep 2
+      /etc/init.d/S40wifi start >/dev/null 2>&1
+      sleep 5
       /etc/init.d/S41dhcpcd restart >/dev/null 2>&1
-      FAIL_COUNT=0
+      sleep 20
+    # Шаг 4 (18 циклов = ~6 минут непрерывного полного блэкаута):
+    # Если за 6 минут мягкие методы не помогли — произошел аппаратный сбой чипа/SDIO.
+    # Чистая перезагрузка системы гарантированно восстановит Wi-Fi без зависаний ядра.
+    elif [ "$FAIL_COUNT" -ge 18 ]; then
+      echo "[network-watchdog] 🚨 Полный блэкаут сети (>6 минут). Аварийная перезагрузка колонки для сброса SDIO..." >> "$LOG"
+      sync
+      reboot -f
+      exit 0
     fi
   done
 }
