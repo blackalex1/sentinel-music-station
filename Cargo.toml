@@ -28,6 +28,7 @@ ratatui = "0.30"
 crossterm = "0.28"
 bytes = "1"
 libc = "0.2"
+lru = "0.18"
 
 [profile.release]
 opt-level = 3

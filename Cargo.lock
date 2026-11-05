@@ -2396,6 +2396,7 @@ dependencies = [
  "crossterm 0.28.1",
  "futures-util",
  "libc",
+ "lru",
  "ratatui",
  "reqwest",
  "rodio",
