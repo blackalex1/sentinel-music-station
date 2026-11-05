@@ -14,11 +14,16 @@ pub struct TrackLoader {
 
 impl TrackLoader {
     pub fn new(config: Arc<StationConfig>) -> Result<Self> {
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true)
-            .build()?;
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30));
+
+        if config.allow_insecure_ssl {
+            builder = builder
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true);
+        }
+
+        let http_client = builder.build()?;
 
         Ok(Self {
             config,

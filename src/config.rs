@@ -85,6 +85,10 @@ pub struct StationConfig {
     /// Воспроизводить голосовое приветствие при старте демона (по умолчанию false — тихий запуск)
     #[serde(default = "default_false")]
     pub startup_greeting: bool,
+
+    /// Разрешать подключение к серверу с недоверенным/самоподписанным SSL сертификатом
+    #[serde(default = "default_false", alias = "insecure_ssl")]
+    pub allow_insecure_ssl: bool,
 }
 
 fn default_ducking_volume() -> f32 {
@@ -173,6 +177,7 @@ impl Default for StationConfig {
             equalizer_mode: default_equalizer_mode(),
             ducking_volume: default_ducking_volume(),
             startup_greeting: false,
+            allow_insecure_ssl: false,
         }
     }
 }

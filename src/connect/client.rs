@@ -128,7 +128,11 @@ impl ConnectClient {
     async fn connect_and_process(&mut self) -> Result<()> {
         let ws_url = self.config.websocket_url()?;
         let connector = if ws_url.starts_with("wss://") {
-            Some(create_tls_connector())
+            if self.config.allow_insecure_ssl {
+                Some(create_tls_connector())
+            } else {
+                None
+            }
         } else {
             None
         };

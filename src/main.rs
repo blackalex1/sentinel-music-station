@@ -137,8 +137,13 @@ async fn main() -> Result<()> {
             println!("Имя устройства: {}", config.device_name);
             println!("ID устройства: {}", config.device_id);
 
-            let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+            let mut client_builder = reqwest::Client::builder();
+            if config.allow_insecure_ssl {
+                client_builder = client_builder
+                    .danger_accept_invalid_certs(true)
+                    .danger_accept_invalid_hostnames(true);
+            }
+            let client = client_builder
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new());
             let health_url = format!("{}/api/system/version", config.server_url.trim_end_matches('/'));
@@ -434,8 +439,13 @@ async fn run_tui_mode(config: Arc<StationConfig>) -> Result<()> {
     });
 
     // Фоновая пересылка команд TUI через REST API целевой колонке
-    let http_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let mut http_client_builder = reqwest::Client::builder();
+    if config.allow_insecure_ssl {
+        http_client_builder = http_client_builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true);
+    }
+    let http_client = http_client_builder
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let target_device_id = config.device_id.clone();
