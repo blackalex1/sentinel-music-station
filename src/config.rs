@@ -216,28 +216,25 @@ impl StationConfig {
 
     /// Формирование полного WebSocket URL для Sentinel Connect
     pub fn websocket_url(&self) -> Result<String> {
-        let base = self.server_url.trim_end_matches('/');
-        let ws_scheme = if base.starts_with("https://") {
-            "wss://"
-        } else if base.starts_with("http://") {
-            "ws://"
-        } else {
-            "ws://"
+        let mut u = url::Url::parse(&self.server_url)
+            .map_err(|e| anyhow::anyhow!("Неверный server_url: {}", e))?;
+
+        let scheme = match u.scheme() {
+            "https" | "wss" => "wss",
+            _ => "ws",
         };
+        u.set_scheme(scheme)
+            .map_err(|_| anyhow::anyhow!("Не удалось установить схему {}", scheme))?;
 
-        let host = base
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
+        u.set_path("/api/remote/ws");
+        u.query_pairs_mut()
+            .clear()
+            .append_pair("token", &self.auth_token)
+            .append_pair("device_id", &self.device_id)
+            .append_pair("device_name", &self.device_name)
+            .append_pair("device_type", &self.device_type);
 
-        let encoded_token = url::form_urlencoded::byte_serialize(self.auth_token.as_bytes()).collect::<String>();
-        let encoded_device_id = url::form_urlencoded::byte_serialize(self.device_id.as_bytes()).collect::<String>();
-        let encoded_name = url::form_urlencoded::byte_serialize(self.device_name.as_bytes()).collect::<String>();
-        let encoded_type = url::form_urlencoded::byte_serialize(self.device_type.as_bytes()).collect::<String>();
-
-        Ok(format!(
-            "{}{}/api/remote/ws?token={}&device_id={}&device_name={}&device_type={}",
-            ws_scheme, host, encoded_token, encoded_device_id, encoded_name, encoded_type
-        ))
+        Ok(u.to_string())
     }
 
     /// Формирование полного HTTP URL для аудиопотока трека
