@@ -343,10 +343,25 @@ impl ConnectClient {
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
                 let track_id = payload.get("track_id")
-                    .and_then(|v| v.as_i64())
-                    .or_else(|| payload.get("id").and_then(|v| v.as_i64()))
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
+                    .or_else(|| payload.get("id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))))
                     .unwrap_or(0);
                 Some(PlayerCommand::SetQueue { queue, track_id })
+            }
+            "SET_REACTION" | "REACTION" => {
+                let track_id = payload.get("track_id")
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
+                    .or_else(|| payload.get("id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))))
+                    .unwrap_or(0);
+                let is_liked = payload.get("is_liked")
+                    .and_then(|v| v.as_bool())
+                    .or_else(|| payload.get("liked").and_then(|v| v.as_bool()))
+                    .unwrap_or(false);
+                let is_disliked = payload.get("is_disliked")
+                    .and_then(|v| v.as_bool())
+                    .or_else(|| payload.get("disliked").and_then(|v| v.as_bool()))
+                    .unwrap_or(false);
+                Some(PlayerCommand::SetReaction { track_id, is_liked, is_disliked })
             }
             "PLAY_TRACK" | "PREPARE_TRACK" | "TRANSFER_PLAYBACK" => {
                 let track_obj = payload.get("track");
@@ -357,10 +372,11 @@ impl ConnectClient {
                 let first_queue_track = queue.first();
 
                 let track_id = payload.get("track_id")
-                    .and_then(|v| v.as_i64())
-                    .or_else(|| payload.get("id").and_then(|v| v.as_i64()))
-                    .or_else(|| track_obj.and_then(|t| t.get("id")).and_then(|v| v.as_i64()))
-                    .or_else(|| first_queue_track.map(|t| t.id))?;
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
+                    .or_else(|| payload.get("id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))))
+                    .or_else(|| track_obj.and_then(|t| t.get("id")).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))))
+                    .or_else(|| first_queue_track.map(|t| t.id))
+                    .unwrap_or(-1);
 
                 let title = payload.get("title")
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -396,19 +412,38 @@ impl ConnectClient {
                     .or_else(|| payload.get("isPreview").and_then(|v| v.as_bool()))
                     .or_else(|| track_obj.and_then(|t| t.get("is_preview")).and_then(|v| v.as_bool()))
                     .or_else(|| track_obj.and_then(|t| t.get("isPreview")).and_then(|v| v.as_bool()))
+                    .or_else(|| first_queue_track.map(|t| t.is_preview))
                     .unwrap_or(track_id < 0);
 
                 let candidate_id = payload.get("candidate_id")
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .or_else(|| payload.get("candidateId").and_then(|v| v.as_str().map(|s| s.to_string())))
                     .or_else(|| track_obj.and_then(|t| t.get("candidate_id")).and_then(|v| v.as_str().map(|s| s.to_string())))
-                    .or_else(|| track_obj.and_then(|t| t.get("candidateId")).and_then(|v| v.as_str().map(|s| s.to_string())));
+                    .or_else(|| track_obj.and_then(|t| t.get("candidateId")).and_then(|v| v.as_str().map(|s| s.to_string())))
+                    .or_else(|| first_queue_track.and_then(|t| t.candidate_id.clone()));
 
                 let cover_url = payload.get("cover_url")
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .or_else(|| payload.get("coverUrl").and_then(|v| v.as_str().map(|s| s.to_string())))
                     .or_else(|| track_obj.and_then(|t| t.get("cover_url")).and_then(|v| v.as_str().map(|s| s.to_string())))
-                    .or_else(|| track_obj.and_then(|t| t.get("coverUrl")).and_then(|v| v.as_str().map(|s| s.to_string())));
+                    .or_else(|| track_obj.and_then(|t| t.get("coverUrl")).and_then(|v| v.as_str().map(|s| s.to_string())))
+                    .or_else(|| first_queue_track.and_then(|t| t.cover_url.clone()));
+
+                let is_liked = payload.get("is_liked")
+                    .and_then(|v| v.as_bool())
+                    .or_else(|| payload.get("liked").and_then(|v| v.as_bool()))
+                    .or_else(|| track_obj.and_then(|t| t.get("is_liked")).and_then(|v| v.as_bool()))
+                    .or_else(|| track_obj.and_then(|t| t.get("liked")).and_then(|v| v.as_bool()))
+                    .or_else(|| first_queue_track.map(|t| t.is_liked))
+                    .unwrap_or(false);
+
+                let is_disliked = payload.get("is_disliked")
+                    .and_then(|v| v.as_bool())
+                    .or_else(|| payload.get("disliked").and_then(|v| v.as_bool()))
+                    .or_else(|| track_obj.and_then(|t| t.get("is_disliked")).and_then(|v| v.as_bool()))
+                    .or_else(|| track_obj.and_then(|t| t.get("disliked")).and_then(|v| v.as_bool()))
+                    .or_else(|| first_queue_track.map(|t| t.is_disliked))
+                    .unwrap_or(false);
 
                 Some(PlayerCommand::PlayTrack {
                     track_id,
@@ -421,6 +456,8 @@ impl ConnectClient {
                     is_preview,
                     candidate_id,
                     cover_url,
+                    is_liked,
+                    is_disliked,
                 })
             }
             _ => {

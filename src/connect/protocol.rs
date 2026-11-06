@@ -1,9 +1,81 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::{self, Deserializer, Visitor}, Deserialize, Serialize};
+
+/// Гибкая десериализация ID трека (поддерживает как целые числа, так и строки кандидатов вроде "candidate_hitmo_...")
+pub fn deserialize_flexible_id<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct IdVisitor;
+
+    impl<'de> Visitor<'de> for IdVisitor {
+        type Value = i64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an integer or string representing a track ID")
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value as i64)
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value as i64)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if let Ok(num) = value.parse::<i64>() {
+                Ok(num)
+            } else {
+                // Строковые ID предпросмотров кандидатов (напр. "candidate_...")
+                Ok(-1)
+            }
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(0)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(0)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+    }
+
+    deserializer.deserialize_any(IdVisitor)
+}
 
 /// Метаданные текущего трека
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrackMeta {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_id")]
     pub id: i64,
     #[serde(default)]
     pub title: String,
@@ -19,6 +91,10 @@ pub struct TrackMeta {
     pub is_preview: bool,
     #[serde(default)]
     pub candidate_id: Option<String>,
+    #[serde(default)]
+    pub is_liked: bool,
+    #[serde(default)]
+    pub is_disliked: bool,
 }
 
 fn default_volume() -> f32 {
@@ -154,10 +230,17 @@ pub enum PlayerCommand {
         is_preview: bool,
         candidate_id: Option<String>,
         cover_url: Option<String>,
+        is_liked: bool,
+        is_disliked: bool,
     },
     SetQueue {
         queue: Vec<TrackMeta>,
         track_id: i64,
+    },
+    SetReaction {
+        track_id: i64,
+        is_liked: bool,
+        is_disliked: bool,
     },
     StartFlow,
     Duck { ducked: bool },

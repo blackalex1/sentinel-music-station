@@ -98,8 +98,10 @@ impl AudioPlayer {
                             is_preview,
                             candidate_id,
                             cover_url,
+                            is_liked,
+                            is_disliked,
                         } => {
-                            info!("Запуск трека ID: {} (preview: {}) - '{}' / '{}' (позиция: {} мс, auto_play: {})", track_id, is_preview, title, artist, position_ms, auto_play);
+                            info!("Запуск трека ID: {} (preview: {}, like: {}) - '{}' / '{}' (позиция: {} мс, auto_play: {})", track_id, is_preview, is_liked, title, artist, position_ms, auto_play);
                             self.is_flow_active = false;
                             self.recent_flow_ids.clear();
                             self.queue.set_queue(queue, track_id);
@@ -129,6 +131,8 @@ impl AudioPlayer {
                                 cover_url: resolved_cover,
                                 is_preview,
                                 candidate_id: candidate_id.clone(),
+                                is_liked,
+                                is_disliked,
                             };
 
                             let mut pre_state = self.state_tx.borrow().clone();
@@ -168,6 +172,19 @@ impl AudioPlayer {
                             };
                             self.queue.set_queue(queue, cur_id);
                             let mut state = self.state_tx.borrow().clone();
+                            state.queue = self.queue.tracks();
+                            let _ = self.state_tx.send(state);
+                        }
+                        PlayerCommand::SetReaction { track_id, is_liked, is_disliked } => {
+                            info!("Обновление реакции для трека {}: like={}, dislike={}", track_id, is_liked, is_disliked);
+                            self.queue.update_reaction(track_id, is_liked, is_disliked);
+                            let mut state = self.state_tx.borrow().clone();
+                            if let Some(ref mut cur) = state.current_track {
+                                if track_id == 0 || cur.id == track_id {
+                                    cur.is_liked = is_liked;
+                                    cur.is_disliked = is_disliked;
+                                }
+                            }
                             state.queue = self.queue.tracks();
                             let _ = self.state_tx.send(state);
                         }

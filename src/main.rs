@@ -216,6 +216,8 @@ async fn main() -> Result<()> {
                 is_preview: false,
                 candidate_id: None,
                 cover_url: None,
+                is_liked: false,
+                is_disliked: false,
             }).await?;
 
             tokio::spawn(async move {
@@ -468,6 +470,7 @@ async fn run_tui_mode(config: Arc<StationConfig>) -> Result<()> {
                 PlayerCommand::SetRepeat { mode } => ("REPEAT", serde_json::json!({ "mode": mode })),
                 PlayerCommand::PlayTrack { track_id, .. } => ("PLAY_TRACK", serde_json::json!({ "track_id": track_id })),
                 PlayerCommand::SetQueue { queue, track_id } => ("SET_QUEUE", serde_json::json!({ "queue": queue, "track_id": track_id })),
+                PlayerCommand::SetReaction { track_id, is_liked, is_disliked } => ("SET_REACTION", serde_json::json!({ "track_id": track_id, "is_liked": is_liked, "is_disliked": is_disliked })),
                 PlayerCommand::StartFlow => ("START_FLOW", serde_json::json!({})),
                 PlayerCommand::Duck { ducked } => ("DUCK", serde_json::json!({ "ducked": ducked })),
             };

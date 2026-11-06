@@ -229,4 +229,14 @@ impl PlaybackQueue {
             self.order.extend(new_indices);
         }
     }
+
+    /// Обновление статуса лайка/дизлайка для трека в очереди
+    pub fn update_reaction(&mut self, track_id: i64, is_liked: bool, is_disliked: bool) {
+        for t in &mut self.tracks {
+            if t.id == track_id {
+                t.is_liked = is_liked;
+                t.is_disliked = is_disliked;
+            }
+        }
+    }
 }
