@@ -6,7 +6,7 @@ use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StationConfig {
-    /// URL сервера Sentinel Music (например, http://192.168.1.100:8000)
+    /// URL сервера Sentinel Music (например, https://music.local:8000)
     pub server_url: String,
 
     /// Токен авторизации (API токен пользователя)
@@ -91,6 +91,12 @@ pub struct StationConfig {
     pub allow_insecure_ssl: bool,
 }
 
+fn default_server_url() -> String {
+    std::env::var("SENTINEL_SERVER_URL")
+        .or_else(|_| std::env::var("SERVER_URL"))
+        .unwrap_or_else(|_| "http://localhost:8000".to_string())
+}
+
 fn default_ducking_volume() -> f32 {
     0.15
 }
@@ -124,14 +130,67 @@ fn default_input_device() -> String {
 }
 
 fn default_device_id() -> String {
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "station".to_string());
-    format!("sentinel-station-{}", hostname)
+    // 1. Проверяем переменные окружения
+    if let Ok(id) = std::env::var("SENTINEL_DEVICE_ID").or_else(|_| std::env::var("DEVICE_ID")) {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    // 2. Читаем /etc/hostname
+    let hostname = std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty() && s != "localhost");
+
+    let host = hostname
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| {
+            // 3. Fallback: поиск уникального MAC-адреса сетевого интерфейса
+            for iface in &["wlan0", "eth0", "ra0", "en0"] {
+                if let Ok(mac) = std::fs::read_to_string(format!("/sys/class/net/{}/address", iface)) {
+                    let clean = mac.replace(':', "").trim().to_string();
+                    if !clean.is_empty() {
+                        return clean;
+                    }
+                }
+            }
+            "station".to_string()
+        });
+
+    format!("sentinel-station-{}", host)
 }
 
 fn default_device_name() -> String {
-    "Яндекс.Станция (Sentinel)".to_string()
+    if let Ok(name) = std::env::var("SENTINEL_DEVICE_NAME") {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    // Автоматическое определение модели устройства по /etc/hostname и /proc/device-tree/model
+    let hostname = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+    let model = std::fs::read_to_string("/proc/device-tree/model").unwrap_or_default();
+    let combined = format!("{} {}", hostname, model).to_lowercase();
+
+    if combined.contains("mini2") || combined.contains("mini_2") {
+        "Яндекс Станция Мини 2".to_string()
+    } else if combined.contains("mini") {
+        "Яндекс Станция Мини".to_string()
+    } else if combined.contains("midi") {
+        "Яндекс Станция Миди".to_string()
+    } else if combined.contains("micro") || combined.contains("light") {
+        "Яндекс Станция Лайт".to_string()
+    } else if combined.contains("max") {
+        "Яндекс Станция Макс".to_string()
+    } else if combined.contains("station2") || combined.contains("station_2") {
+        "Яндекс Станция 2".to_string()
+    } else {
+        "Яндекс.Станция (Sentinel)".to_string()
+    }
 }
 
 fn default_device_type() -> String {
@@ -157,7 +216,7 @@ fn default_ping_interval() -> u64 {
 impl Default for StationConfig {
     fn default() -> Self {
         Self {
-            server_url: "http://192.168.1.100:8000".to_string(),
+            server_url: default_server_url(),
             auth_token: "".to_string(),
             device_id: default_device_id(),
             device_name: default_device_name(),

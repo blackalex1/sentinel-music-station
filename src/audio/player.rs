@@ -2,7 +2,7 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
-use rodio::{Decoder, OutputStreamHandle, Sink, Source};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
@@ -13,6 +13,10 @@ use crate::audio::source::BufferedStreamSource;
 use crate::config::StationConfig;
 use crate::connect::protocol::{PlayerCommand, PlayerState, TrackMeta};
 
+/// Обертка над rodio::OutputStream с маркером Send для переноса между асинхронными задачами Tokio
+struct AudioOutputGuard(#[allow(dead_code)] OutputStream);
+unsafe impl Send for AudioOutputGuard {}
+
 /// Главный контроллер аудиовоспроизведения Станции
 pub struct AudioPlayer {
     config: Arc<StationConfig>,
@@ -21,29 +25,25 @@ pub struct AudioPlayer {
     sample_buffer: Arc<Mutex<Vec<f32>>>,
     loader: TrackLoader,
     queue: PlaybackQueue,
-    stream_handle: OutputStreamHandle,
-    sink: Arc<Mutex<Sink>>,
+    audio_stream: Option<AudioOutputGuard>,
+    stream_handle: Option<OutputStreamHandle>,
+    sink: Option<Arc<Mutex<Sink>>>,
     jack_state: Option<bool>,
     current_audio_data: Option<bytes::Bytes>,
     current_track_id: Option<i64>,
     is_flow_active: bool,
     recent_flow_ids: Vec<i64>,
     is_ducked: bool,
+    idle_since: Option<Instant>,
 }
 
 impl AudioPlayer {
     pub fn new(
         config: Arc<StationConfig>,
-        stream_handle: OutputStreamHandle,
         command_rx: mpsc::Receiver<PlayerCommand>,
         state_tx: watch::Sender<PlayerState>,
         sample_buffer: Arc<Mutex<Vec<f32>>>,
     ) -> Result<Self> {
-        let sink = Sink::try_new(&stream_handle)
-            .context("Не удалось создать аудиоплеер Sink")?;
-
-        sink.set_volume(1.0);
-
         let mut jack_state = None;
         sync_hardware_routing(&mut jack_state, &config.audio_routing);
 
@@ -64,15 +64,45 @@ impl AudioPlayer {
             sample_buffer,
             loader,
             queue: PlaybackQueue::new(),
-            stream_handle,
-            sink: Arc::new(Mutex::new(sink)),
+            audio_stream: None,
+            stream_handle: None,
+            sink: None,
             jack_state,
             current_audio_data: None,
             current_track_id: None,
             is_flow_active: false,
             recent_flow_ids: Vec::new(),
             is_ducked: false,
+            idle_since: Some(Instant::now()),
         })
+    }
+
+    /// Ленивая инициализация аудиоустройства только при фактическом воспроизведении
+    fn ensure_audio_stream(&mut self) -> Result<OutputStreamHandle> {
+        self.idle_since = None;
+        if self.stream_handle.is_none() {
+            info!("🎵 Открытие ALSA аудиоустройства для воспроизведения...");
+            let (stream, handle) = OutputStream::try_default()
+                .context("Не удалось открыть аудиоустройство ALSA/Audio")?;
+            self.audio_stream = Some(AudioOutputGuard(stream));
+            self.stream_handle = Some(handle);
+        }
+        Ok(self.stream_handle.as_ref().unwrap().clone())
+    }
+
+    /// Освобождение аудиоустройства в режим сна/простоя (0% CPU, уступает ALSA Алисе)
+    fn release_audio(&mut self) {
+        if self.audio_stream.is_some() || self.sink.is_some() {
+            info!("💤 Освобождение ALSA аудиоустройства в режим сна/простоя (0% CPU)");
+            if let Some(sink) = self.sink.take() {
+                if let Ok(s) = sink.lock() {
+                    s.stop();
+                }
+            }
+            self.sink = None;
+            self.stream_handle = None;
+            self.audio_stream = None;
+        }
     }
 
     /// Главный цикл обработки команд воспроизведения и отслеживания прогресса
@@ -190,7 +220,7 @@ impl AudioPlayer {
                         }
                         PlayerCommand::Play => {
                             sync_hardware_routing(&mut self.jack_state, &self.config.audio_routing);
-                            let is_empty = self.sink.lock().map(|s| s.empty()).unwrap_or(false);
+                            let is_empty = self.sink.as_ref().and_then(|s| s.lock().ok()).map(|s| s.empty()).unwrap_or(true);
                             if is_empty {
                                 if self.queue.is_empty() {
                                     if let Ok(tracks) = self.loader.fetch_server_tracks().await {
@@ -202,6 +232,7 @@ impl AudioPlayer {
                                     if let Ok(()) = self.load_and_play_meta(&track).await {
                                         track_started_at = Some(Instant::now());
                                         accumulated_position = Duration::ZERO;
+                                        self.idle_since = None;
                                         let mut state = self.state_tx.borrow().clone();
                                         state.is_playing = true;
                                         state.position_ms = 0;
@@ -212,9 +243,12 @@ impl AudioPlayer {
                                     }
                                 }
                             } else {
-                                if let Ok(sink) = self.sink.lock() {
-                                    sink.play();
+                                if let Some(ref sink) = self.sink {
+                                    if let Ok(s) = sink.lock() {
+                                        s.play();
+                                    }
                                 }
+                                self.idle_since = None;
                                 if track_started_at.is_none() {
                                     track_started_at = Some(Instant::now());
                                 }
@@ -224,8 +258,13 @@ impl AudioPlayer {
                             }
                         }
                         PlayerCommand::Pause => {
-                            if let Ok(sink) = self.sink.lock() {
-                                sink.pause();
+                            if let Some(ref sink) = self.sink {
+                                if let Ok(s) = sink.lock() {
+                                    s.pause();
+                                }
+                            }
+                            if self.idle_since.is_none() {
+                                self.idle_since = Some(Instant::now());
                             }
                             if let Some(started) = track_started_at.take() {
                                 accumulated_position += started.elapsed();
@@ -236,18 +275,10 @@ impl AudioPlayer {
                         }
                         PlayerCommand::TogglePlay => {
                             sync_hardware_routing(&mut self.jack_state, &self.config.audio_routing);
+                            let is_empty = self.sink.as_ref().and_then(|s| s.lock().ok()).map(|s| s.empty()).unwrap_or(true);
+                            let is_paused = self.sink.as_ref().and_then(|s| s.lock().ok()).map(|s| s.is_paused()).unwrap_or(false);
                             let mut is_playing = false;
-                            let mut is_empty = false;
-                            if let Ok(sink) = self.sink.lock() {
-                                if sink.empty() {
-                                    is_empty = true;
-                                } else if sink.is_paused() {
-                                    sink.play();
-                                    is_playing = true;
-                                } else {
-                                    sink.pause();
-                                }
-                            }
+
                             if is_empty {
                                 // Если ничего не играло, запускаем трек из очереди или подтягиваем с сервера
                                 if self.queue.is_empty() {
@@ -260,6 +291,7 @@ impl AudioPlayer {
                                     if let Ok(()) = self.load_and_play_meta(&track).await {
                                         track_started_at = Some(Instant::now());
                                         accumulated_position = Duration::ZERO;
+                                        self.idle_since = None;
                                         let mut state = self.state_tx.borrow().clone();
                                         state.is_playing = true;
                                         state.position_ms = 0;
@@ -269,23 +301,43 @@ impl AudioPlayer {
                                         let _ = self.state_tx.send(state);
                                     }
                                 }
-                            } else {
-                                if is_playing {
+                            } else if is_paused {
+                                if let Some(ref sink) = self.sink {
+                                    if let Ok(s) = sink.lock() {
+                                        s.play();
+                                        is_playing = true;
+                                    }
+                                }
+                                self.idle_since = None;
+                                if track_started_at.is_none() {
                                     track_started_at = Some(Instant::now());
-                                } else if let Some(started) = track_started_at.take() {
-                                    accumulated_position += started.elapsed();
                                 }
                                 let mut state = self.state_tx.borrow().clone();
                                 state.is_playing = is_playing;
                                 let _ = self.state_tx.send(state);
+                            } else {
+                                if let Some(ref sink) = self.sink {
+                                    if let Ok(s) = sink.lock() {
+                                        s.pause();
+                                    }
+                                }
+                                if self.idle_since.is_none() {
+                                    self.idle_since = Some(Instant::now());
+                                }
+                                if let Some(started) = track_started_at.take() {
+                                    accumulated_position += started.elapsed();
+                                }
+                                let mut state = self.state_tx.borrow().clone();
+                                state.is_playing = false;
+                                let _ = self.state_tx.send(state);
                             }
                         }
                         PlayerCommand::Stop => {
-                            if let Ok(sink) = self.sink.lock() {
-                                sink.stop();
-                            }
+                            self.release_audio();
                             track_started_at = None;
                             accumulated_position = Duration::ZERO;
+                            self.current_audio_data = None;
+                            self.current_track_id = None;
                             let mut state = self.state_tx.borrow().clone();
                             state.is_playing = false;
                             state.position_ms = 0;
@@ -293,11 +345,7 @@ impl AudioPlayer {
                         }
                         PlayerCommand::Seek { position_ms } => {
                             info!("Получена команда перемотки (SEEK) на {} мс ({:.1} сек)", position_ms, position_ms as f64 / 1000.0);
-                            let was_playing = if let Ok(sink) = self.sink.lock() {
-                                !sink.is_paused() && !sink.empty()
-                            } else {
-                                false
-                            };
+                            let was_playing = self.sink.as_ref().and_then(|s| s.lock().ok()).map(|s| !s.is_paused() && !s.empty()).unwrap_or(false);
 
                             let cur_track_id = self.state_tx.borrow().current_track.as_ref().map(|t| t.id);
                             let audio_opt = self.current_audio_data.clone();
@@ -337,8 +385,10 @@ impl AudioPlayer {
                             let clamped = volume.clamp(0.0, 1.0);
                             info!("🔊 Установка громкости: {:.0}%", clamped * 100.0);
                             let vol = if self.is_ducked { self.config.ducking_volume } else { 1.0 };
-                            if let Ok(sink) = self.sink.lock() {
-                                sink.set_volume(vol);
+                            if let Some(ref sink) = self.sink {
+                                if let Ok(s) = sink.lock() {
+                                    s.set_volume(vol);
+                                }
                             }
                             set_hardware_volume(clamped);
                             save_persisted_volume(clamped);
@@ -350,8 +400,10 @@ impl AudioPlayer {
                             self.is_ducked = ducked;
                             let vol = if ducked { self.config.ducking_volume } else { 1.0 };
                             info!("🔉 Приглушение музыки для Алисы (Audio Ducking): ducked={}, volume={:.0}%", ducked, vol * 100.0);
-                            if let Ok(sink) = self.sink.lock() {
-                                sink.set_volume(vol);
+                            if let Some(ref sink) = self.sink {
+                                if let Ok(s) = sink.lock() {
+                                    s.set_volume(vol);
+                                }
                             }
                         }
                         PlayerCommand::StartFlow => {
@@ -544,14 +596,26 @@ impl AudioPlayer {
                         sync_hardware_routing(&mut self.jack_state, &self.config.audio_routing);
                     }
 
-                    let is_empty;
-                    let is_paused;
-                    if let Ok(sink) = self.sink.lock() {
-                        is_empty = sink.empty();
-                        is_paused = sink.is_paused();
+                // Если плеер на паузе более 15 секунд или трек завершился — освобождаем ALSA устройство для сна (0% CPU)
+                if let Some(idle_at) = self.idle_since {
+                    if idle_at.elapsed() > Duration::from_secs(15) && !self.state_tx.borrow().is_playing {
+                        self.release_audio();
+                    }
+                }
+
+                let is_empty;
+                let is_paused;
+                if let Some(ref sink) = self.sink {
+                    if let Ok(s) = sink.lock() {
+                        is_empty = s.empty();
+                        is_paused = s.is_paused();
                     } else {
                         continue;
                     }
+                } else {
+                    is_empty = true;
+                    is_paused = false;
+                }
 
                     // Защита от ложного срабатывания empty() в первые 2 секунды после запуска трека
                     let just_started = track_started_at
@@ -643,6 +707,9 @@ impl AudioPlayer {
                             state.is_playing = false;
                             track_started_at = None;
                             accumulated_position = Duration::ZERO;
+                            if self.idle_since.is_none() {
+                                self.idle_since = Some(Instant::now());
+                            }
                             let _ = self.state_tx.send(state);
                         }
                     } else if !is_paused {
@@ -680,22 +747,25 @@ impl AudioPlayer {
                 self.config.visualizer_enabled,
             );
 
-            let sink_lock = self.sink.lock();
-            if let Ok(mut sink) = sink_lock {
-                // Обязательно останавливаем старый Sink, чтобы rodio удалил его источники из микшера
-                sink.stop();
-                let new_sink = Sink::try_new(&self.stream_handle)
-                    .context("Не удалось пересоздать Sink")?;
-                let vol = if self.is_ducked { self.config.ducking_volume } else { 1.0 };
-                new_sink.set_volume(vol);
-                new_sink.append(buffered_source);
-                if auto_play {
-                    new_sink.play();
-                } else {
-                    new_sink.pause();
+            let handle = self.ensure_audio_stream()?;
+            if let Some(old_sink) = self.sink.take() {
+                if let Ok(s) = old_sink.lock() {
+                    s.stop();
                 }
-                *sink = new_sink;
             }
+            let new_sink = Sink::try_new(&handle)
+                .context("Не удалось пересоздать Sink")?;
+            let vol = if self.is_ducked { self.config.ducking_volume } else { 1.0 };
+            new_sink.set_volume(vol);
+            new_sink.append(buffered_source);
+            if auto_play {
+                new_sink.play();
+                self.idle_since = None;
+            } else {
+                new_sink.pause();
+                self.idle_since = Some(Instant::now());
+            }
+            self.sink = Some(Arc::new(Mutex::new(new_sink)));
 
             Ok(())
         }
@@ -765,21 +835,25 @@ impl AudioPlayer {
         );
 
         // 4. Пересоздаем Sink и применяем громкость и статус паузы
-        let sink_lock = self.sink.lock();
-        if let Ok(mut sink) = sink_lock {
-            sink.stop();
-            let new_sink = Sink::try_new(&self.stream_handle)
-                .context("Не удалось пересоздать Sink для перемотки")?;
-            let vol = if self.is_ducked { self.config.ducking_volume } else { 1.0 };
-            new_sink.set_volume(vol);
-            new_sink.append(buffered_source);
-            if auto_play {
-                new_sink.play();
-            } else {
-                new_sink.pause();
+        let handle = self.ensure_audio_stream()?;
+        if let Some(old_sink) = self.sink.take() {
+            if let Ok(s) = old_sink.lock() {
+                s.stop();
             }
-            *sink = new_sink;
         }
+        let new_sink = Sink::try_new(&handle)
+            .context("Не удалось пересоздать Sink для перемотки")?;
+        let vol = if self.is_ducked { self.config.ducking_volume } else { 1.0 };
+        new_sink.set_volume(vol);
+        new_sink.append(buffered_source);
+        if auto_play {
+            new_sink.play();
+            self.idle_since = None;
+        } else {
+            new_sink.pause();
+            self.idle_since = Some(Instant::now());
+        }
+        self.sink = Some(Arc::new(Mutex::new(new_sink)));
 
         Ok(())
     }

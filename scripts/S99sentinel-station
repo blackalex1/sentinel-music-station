@@ -13,98 +13,60 @@ SUPERVISOR_PIDFILE=/var/run/sentinel-supervisor.pid
 WATCHDOG_PIDFILE=/var/run/sentinel-watchdog.pid
 
 cleanup_ipc() {
-  # Если аппаратный аудиовыход удерживается mediad на старте/перезапуске,
-  # мягко сбрасываем mediad (quasar_launcher2 поднимет его чистым за 0.1с без захвата ALSA)
-  if fuser /dev/snd/pcmC0D0p >/dev/null 2>&1; then
-    for p in $(fuser /dev/snd/pcmC0D0p 2>/dev/null); do
-      if [ -f "/proc/$p/cmdline" ] && grep -q -- "--mediad" "/proc/$p/cmdline" 2>/dev/null; then
-        echo "[supervisor] Освобождение ALSA от зависшего mediad (PID $p)..." >> "$LOG"
-        kill -9 "$p" 2>/dev/null
-        sleep 1
-      fi
-    done
-  fi
-
+  # Очистка устаревших System V IPC семафоров и сегментов памяти ALSA dmix (ipc_key 1024)
   for s in $(ipcs -s 2>/dev/null | awk '$1=="0x00000400"{print $2}'); do ipcrm -s "$s" 2>/dev/null; done
   for m in $(ipcs -m 2>/dev/null | awk '$1=="0x00000400"||$1=="0x00000401"{print $2}'); do ipcrm -m "$m" 2>/dev/null; done
 }
 
 network_watchdog() {
-  # Интеллектуальный самовосстанавливающийся сторож Wi-Fi сети
+  # Безопасный сторож Wi-Fi сети (Zero Hardcode, без убийства системных демонов и без reboot)
   FAIL_COUNT=0
 
-  # Извлекаем IP сервера из конфигурации
-  SERVER_IP=$(sed -n 's/^[[:space:]]*server_url[[:space:]]*=[[:space:]]*"[^:]*:\/\/\([^:/]*\).*/\1/p' "$CONF" 2>/dev/null)
-  [ -z "$SERVER_IP" ] && SERVER_IP="192.168.1.97"
-
   while true; do
-    sleep 20
+    sleep 30
 
-    # 1. Проверяем состояние Wi-Fi ассоциации (wpa_supplicant)
+    # 1. Извлекаем хост сервера из конфигурации (если указан)
+    SERVER_HOST=$(sed -n 's/^[[:space:]]*server_url[[:space:]]*=[[:space:]]*"[^:]*:\/\/\([^:/]*\).*/\1/p' "$CONF" 2>/dev/null)
+
+    # 2. Проверяем состояние Wi-Fi ассоциации (wpa_supplicant)
     WPA_STATE=$(wpa_cli status 2>/dev/null | sed -n 's/^wpa_state=//p')
 
-    # 2. Проверяем шлюз по умолчанию
-    GATEWAY=$(ip route 2>/dev/null | sed -n 's/.*default via \([0-9.]*\).*/\1/p' | head -n 1)
-    [ -z "$GATEWAY" ] && GATEWAY="192.168.1.1"
+    # 3. Динамически определяем шлюз по умолчанию из текущей таблицы маршрутизации ядра
+    GATEWAY=$(ip route 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
 
     IS_NET_OK=1
-    if [ "$WPA_STATE" != "COMPLETED" ]; then
+
+    if [ -n "$WPA_STATE" ] && [ "$WPA_STATE" != "COMPLETED" ]; then
       IS_NET_OK=0
-    elif ! ping -c 2 -w 3 "$GATEWAY" >/dev/null 2>&1; then
-      # Двойная проверка через сервер Sentinel Connect
-      if ! ping -c 2 -w 3 "$SERVER_IP" >/dev/null 2>&1; then
+    elif [ -n "$GATEWAY" ] && ! ping -c 1 -w 2 "$GATEWAY" >/dev/null 2>&1; then
+      # Если шлюз временно не ответил, проверяем сервер Sentinel (если хост задан)
+      if [ -n "$SERVER_HOST" ]; then
+        if ! ping -c 1 -w 2 "$SERVER_HOST" >/dev/null 2>&1; then
+          IS_NET_OK=0
+        fi
+      else
         IS_NET_OK=0
       fi
     fi
 
     if [ "$IS_NET_OK" -eq 1 ]; then
       if [ "$FAIL_COUNT" -gt 0 ]; then
-        echo "[network-watchdog] ✅ Связь с сетью успешно восстановлена (WPA: $WPA_STATE, Шлюз: $GATEWAY)" >> "$LOG"
+        echo "[network-watchdog] ✅ Связь с сетью стабильна (WPA: ${WPA_STATE:-N/A}, Шлюз: ${GATEWAY:-N/A})" >> "$LOG"
       fi
       FAIL_COUNT=0
       continue
     fi
 
     FAIL_COUNT=$((FAIL_COUNT + 1))
-    echo "[network-watchdog] ⚠️ Потеря связи с сетью #$FAIL_COUNT (WPA: $WPA_STATE, Шлюз: $GATEWAY)" >> "$LOG"
+    echo "[network-watchdog] ⚠️ Задержка/потеря связи #$FAIL_COUNT (WPA: ${WPA_STATE:-N/A}, Шлюз: ${GATEWAY:-N/A})" >> "$LOG"
 
-    # Не предпринимаем резких действий на кратковременные провалы (DFS / смену каналов роутером)
-    # Ждем минимум 3 цикла (60 секунд стабильного отсутствия связи)
-    if [ "$FAIL_COUNT" -lt 3 ]; then
-      continue
-    fi
-
-    # Шаг 1 (~60 сек): Мягкая переассоциация с точкой доступа и обновление DHCP
-    if [ "$FAIL_COUNT" -eq 3 ]; then
-      echo "[network-watchdog] 🔄 Мягкая переассоциация Wi-Fi (wpa_cli reassociate)..." >> "$LOG"
-      wpa_cli reassociate >/dev/null 2>&1
-      dhcpcd -n wlan0 >/dev/null 2>&1
-      sleep 10
-    # Шаг 2 (~100-120 сек): Принудительный reconnect wpa_supplicant и мягкий рестарт DHCP
-    elif [ "$FAIL_COUNT" -eq 5 ]; then
-      echo "[network-watchdog] 🔄 Принудительный reconnect wpa_supplicant и рестарт DHCP..." >> "$LOG"
-      wpa_cli disconnect >/dev/null 2>&1
-      sleep 2
-      wpa_cli reconnect >/dev/null 2>&1
-      /etc/init.d/S41dhcpcd restart >/dev/null 2>&1
-      sleep 15
-    # Шаг 3 (~200 сек = ~3.5 мин): Перезапуск служб wpa_supplicant и dhcpcd (БЕЗ выгрузки драйверов ядра)
-    elif [ "$FAIL_COUNT" -eq 9 ]; then
-      echo "[network-watchdog] 🔄 Перезапуск служб wpa_supplicant и dhcpcd..." >> "$LOG"
-      start-stop-daemon -K -x /usr/sbin/wpa_supplicant -p /var/run/wpa_supplicant.pid -o 2>/dev/null
-      sleep 2
-      /etc/init.d/S40wifi start >/dev/null 2>&1
-      sleep 5
-      /etc/init.d/S41dhcpcd restart >/dev/null 2>&1
-      sleep 20
-    # Шаг 4 (18 циклов = ~6 минут непрерывного полного блэкаута):
-    # Если за 6 минут мягкие методы не помогли — произошел аппаратный сбой чипа/SDIO.
-    # Чистая перезагрузка системы гарантированно восстановит Wi-Fi без зависаний ядра.
-    elif [ "$FAIL_COUNT" -ge 18 ]; then
-      echo "[network-watchdog] 🚨 Полный блэкаут сети (>6 минут). Аварийная перезагрузка колонки для сброса SDIO..." >> "$LOG"
-      sync
-      reboot -f
-      exit 0
+    # Мягкий запрос переподключения Wi-Fi только при длительном отсутствии связи (>3 минут)
+    # НИКОГДА не убиваем wpa_supplicant (чтобы не сломать связь Квазара / Алисы),
+    # НИКОГДА не перезапускаем dhcpcd (чтобы не удалить маршрут по умолчанию),
+    # НИКОГДА не перезагружаем колонку (reboot).
+    if [ "$FAIL_COUNT" -ge 6 ] && [ $((FAIL_COUNT % 4)) -eq 0 ]; then
+      echo "[network-watchdog] 🔄 Мягкий запрос переподключения Wi-Fi через wpa_cli..." >> "$LOG"
+      wpa_cli reconnect >/dev/null 2>&1 || wpa_cli reassociate >/dev/null 2>&1
     fi
   done
 }
@@ -134,9 +96,8 @@ supervisor_loop() {
 
     START_TIME=$(date +%s)
 
-    # 2. Запуск демона с приоритетом nice -10 (защита звука ALSA от задержек CPU)
-    # и флагом --quiet (тихий запуск без лишнего звукового приветствия посреди ночи)
-    nice -n -10 "$BIN" --config "$CONF" start --quiet >> "$LOG" 2>&1 &
+    # 2. Запуск демона со стандартным приоритетом и флагом --quiet
+    "$BIN" --config "$CONF" start --quiet >> "$LOG" 2>&1 &
     DAEMON_PID=$!
 
     # 3. Защита от OOM Killer: запретить ядру Linux убивать Sentinel при нехватке RAM

@@ -3,9 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rodio::{OutputStream, OutputStreamHandle};
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 mod audio;
@@ -163,8 +162,6 @@ async fn main() -> Result<()> {
         Commands::Play { track_id } => {
             info!("Тестовый запуск трека ID: {} на звуковом устройстве '{}'", track_id, config.audio_device);
             cleanup_stale_alsa_ipc();
-            let (_stream, stream_handle) = OutputStream::try_default()
-                .context("Не удалось открыть звуковое устройство ALSA/Audio")?;
 
             let (cmd_tx, cmd_rx) = mpsc::channel(32);
             let initial_volume = audio::routing::load_persisted_volume().unwrap_or(config.initial_volume);
@@ -199,7 +196,6 @@ async fn main() -> Result<()> {
 
             let mut player = AudioPlayer::new(
                 config.clone(),
-                stream_handle,
                 cmd_rx,
                 state_tx,
                 sample_buffer,
@@ -237,27 +233,7 @@ async fn main() -> Result<()> {
         }
         Commands::Start { quiet } => {
             cleanup_stale_alsa_ipc();
-            let mut attempts = 0;
-            let (_stream, stream_handle) = loop {
-                match OutputStream::try_default() {
-                    Ok(res) => break res,
-                    Err(e) => {
-                        attempts += 1;
-                        if attempts == 1 {
-                            warn!("ALSA аудиоустройство временно занято (возможно, играет Алиса: {}). Запрос на сброс воспроизведения...", e);
-                            VoiceInterceptor::stop_alice_playback();
-                        }
-                        if attempts >= 10 {
-                            warn!("ALSA по-прежнему занято после 10 попыток. Защитное ожидание 3 сек...");
-                            tokio::time::sleep(Duration::from_secs(3)).await;
-                            attempts = 0;
-                        } else {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
-                    }
-                }
-            };
-            run_daemon(config, stream_handle, quiet).await
+            run_daemon(config, quiet).await
         }
         Commands::Tui => {
             run_tui_mode(config).await
@@ -268,7 +244,6 @@ async fn main() -> Result<()> {
 /// Запуск в режиме фонового демона
 async fn run_daemon(
     config: Arc<StationConfig>,
-    stream_handle: OutputStreamHandle,
     quiet: bool,
 ) -> Result<()> {
     info!("Запуск демона Sentinel Station v{} (ALSA Native)", env!("CARGO_PKG_VERSION"));
@@ -283,7 +258,7 @@ async fn run_daemon(
     let (state_tx, state_rx) = watch::channel(initial_state);
     let (is_connected_tx, _) = watch::channel(false);
     let (display_tx, display_rx) = mpsc::channel(32);
-    let (is_active_tx, is_active_rx) = watch::channel(true);
+    let (is_active_tx, is_active_rx) = watch::channel(false);
 
     // Автоматическое пробуждение Sentinel при получении команды воспроизведения с телефона/веб-плеера
     let is_active_tx_clone = is_active_tx.clone();
@@ -297,9 +272,28 @@ async fn run_daemon(
                     let _ = display_tx_clone.send(DisplayCommand::Active).await;
                 }
                 VoiceInterceptor::stop_alice_playback();
+            } else if matches!(cmd, PlayerCommand::Stop) {
+                if *is_active_tx_clone.borrow() {
+                    info!("🛑 Команда остановки: возврат в режим ожидания для Алисы");
+                    let _ = is_active_tx_clone.send(false);
+                    let _ = display_tx_clone.send(DisplayCommand::PassThrough).await;
+                }
             }
             if player_cmd_tx.send(cmd).await.is_err() {
                 break;
+            }
+        }
+    });
+
+    // Мониторинг соединения: при потере связи с сервером (если музыка не играет) возвращаем управление Алисе
+    let is_active_tx_conn = is_active_tx.clone();
+    let state_rx_conn = state_rx.clone();
+    let mut is_connected_rx = is_connected_tx.subscribe();
+    tokio::spawn(async move {
+        while is_connected_rx.changed().await.is_ok() {
+            let connected = *is_connected_rx.borrow();
+            if !connected && !state_rx_conn.borrow().is_playing {
+                let _ = is_active_tx_conn.send(false);
             }
         }
     });
@@ -309,7 +303,6 @@ async fn run_daemon(
     // 1. Инициализация аудиодвижка
     let mut player = AudioPlayer::new(
         config.clone(),
-        stream_handle,
         player_cmd_rx,
         state_tx,
         sample_buffer.clone(),

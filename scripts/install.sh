@@ -43,7 +43,7 @@ if [ ! -f "$INSTALL_DIR/config.toml" ]; then
         cp "./config.example.toml" "$INSTALL_DIR/config.toml"
     else
         cat << 'EOF' > "$INSTALL_DIR/config.toml"
-server_url = "http://192.168.1.100:8000"
+server_url = "http://YOUR_SERVER_HOST:8000"
 auth_token = ""
 device_name = "Яндекс.Станция (Sentinel)"
 audio_device = "default"
